@@ -18,15 +18,17 @@
 #import <fcntl.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <os/log.h>
 #import "TPRConfig.h"
 #import "TPRPaths.h"
 #import "TPRPatcher.h"
 #import "TPRTree.h"
 
-// Logs to the system log, keeps the last few lines in memory for the Settings pane's
-// "Share Diagnostics" (plain text, by design), and appends to a shared log file from
-// every process allowed to write it (SpringBoard, Settings, unsandboxed apps), so the
-// report can show what happened elsewhere. Sandboxed apps can't write it; that's fine.
+// Logs to the system log (os_log; NSLog would also print to stderr), keeps the last few
+// lines in memory for the Settings pane's "Share Diagnostics" (plain text, by design), and
+// appends to a shared log file from every process allowed to write it (SpringBoard,
+// Settings, unsandboxed apps), so the report can show what happened elsewhere. Sandboxed
+// apps can't write it; that's fine.
 static NSMutableArray<NSString *> *gRecentLog;
 
 static void TPRAppendToLogFile(NSString *entry) {
@@ -66,15 +68,27 @@ __attribute__((visibility("default"))) NSArray<NSString *> *TPRRecentLog(void) {
 }
 
 #define TPRLog(fmt, ...) do { NSString *_l = [NSString stringWithFormat:fmt, ##__VA_ARGS__]; \
-    NSLog(@"[TopRow] %@", _l); TPRRecord(_l); } while (0)
+    os_log(OS_LOG_DEFAULT, "[TopRow] %{public}@", _l); TPRRecord(_l); } while (0)
 
 
 static id (*orig_keyboardForName)(id, SEL, NSString *);
 static id (*orig_cacheIdentifierForKeyplaneNamed)(id, SEL, NSString *);
 
+// iOS 26 builds one keyboard tree for both orientations; while UIKit loads a keyboard for
+// landscape screen traits (and landscape differs from portrait), this is set and the
+// keyboard is patched for landscape. Main thread only, like keyboard loading.
+static BOOL gLoadingLandscape;
+
 static id hook_keyboardForName(id self, SEL _cmd, NSString *name) {
     id keyboard = orig_keyboardForName(self, _cmd, name);
-    if (!keyboard) return keyboard;
+    if (!keyboard) {
+        // iOS 26: "...-Email" has no keyboard of its own and UIKit falls back to the shared
+        // one. With that type's row turned off, answer for the type with the shared keyboard
+        // handled under the type's name (left as Apple's), so the other types keep the row.
+        NSString *shared = TPRDynamicSharedName(name, [TPRConfig current]);
+        keyboard = shared ? orig_keyboardForName(self, _cmd, shared) : nil;
+        if (!keyboard || !TPRIsDynamicKeyboard(keyboard)) return nil;
+    }
 #if TPR_SIMULATOR
     NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"tpr-raw"];
     NSString *path = [dir stringByAppendingPathComponent:[name stringByAppendingString:@".txt"]];
@@ -84,13 +98,15 @@ static id hook_keyboardForName(id self, SEL _cmd, NSString *name) {
     TPRLog(@"keyboardForName:%@ returned %p", name, keyboard);
 #endif
     NSString *outcome = nil;
-    id patched = TPRPatchKeyboard(keyboard, name, [TPRConfig current], &outcome);
+    TPRConfig *config = [TPRConfig current];
+    id patched = TPRPatchKeyboard(keyboard, name, config, gLoadingLandscape && config.landscapeDiffers, &outcome);
     // Only decisions: UIKit asks many times per keyboard, and "cached" lines would push the
     // useful ones out of the diagnostics buffer.
     if (![outcome isEqualToString:@"cached"]) TPRLog(@"keyboardForName:%@ -> %@", name, outcome);
     return patched ?: keyboard;
 }
 
+// (iOS 26's dynamic keyboards never ask for this: their key views are cached by key name.)
 static id hook_cacheIdentifierForKeyplaneNamed(id self, SEL _cmd, NSString *planeName) {
     id identifier = orig_cacheIdentifierForKeyplaneNamed(self, _cmd, planeName);
     if (![identifier isKindOfClass:[NSString class]]) return identifier;
@@ -147,16 +163,50 @@ static BOOL CallBool(id target, NSString *selName) {
     return [target respondsToSelector:sel] && ((BOOL (*)(id, SEL))objc_msgSend)(target, sel);
 }
 
+static void RefreshKeyViewHints(UIView *view, int depth);
+
+// iOS 26: the layout's TUIKeyplaneView (TextInputUI), if it uses one.
+static UIView *DynamicKeyplaneView(UIView *view, int depth) {
+    if ([view isKindOfClass:NSClassFromString(@"TUIKeyplaneView")]) return view;
+    if (depth > 6) return nil;
+    for (UIView *child in view.subviews) {
+        UIView *found = DynamicKeyplaneView(child, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
 static void UpdateShiftedRow(id layout) {
     TPRConfig *config = [TPRConfig current];
     if (gRelabeling || !config.lowercaseRowWhenAutoShifted) return;
+    id keyboard = CallObject(layout, @"keyboard");
+    // iOS 26: reloading the same keyplane keeps TextInputUI's key views, which it finds by key
+    // name, so the renamed keys would get new views that aren't on screen (pressing one then
+    // crashes). The keyplane view has to lay its keys out again, so without a way to do that
+    // the row isn't relabeled at all.
+    UIView *keyplaneView = nil;
+    SEL reset = NSSelectorFromString(@"resetLayoutAndApplyKeyplane:");
+    if (TPRIsDynamicKeyboard(keyboard)) {
+        keyplaneView = [layout isKindOfClass:[UIView class]] ? DynamicKeyplaneView(layout, 0) : nil;
+        if (![keyplaneView respondsToSelector:reset] ||
+            ![keyplaneView respondsToSelector:NSSelectorFromString(@"currentKeyplane")]) {
+            static dispatch_once_t once;
+            if (keyplaneView) dispatch_once(&once, ^{ TPRLog(@"can't relabel the row on this iOS (keyplane view)"); });
+            return;
+        }
+    }
     id impl = CallObject(NSClassFromString(@"UIKeyboardImpl"), @"activeInstance");
     BOOL autoShifted = CallBool(layout, @"autoShift") && !CallBool(impl, @"isShiftLocked");
-    BOOL landscape = TPRIsLandscapeKeyboard(CallObject(layout, @"keyboard"), CallObject(layout, @"keyboardName"));
+    BOOL landscape = TPRIsLandscapeKeyboard(keyboard, CallObject(layout, @"keyboardName"));
     if (!TPRRelabelShiftedRow(CallObject(layout, @"keyplane"), autoShifted, landscape, config)) return;
     gRelabeling = YES;
     CallVoid(layout, @"reloadCurrentKeyplane");
     gRelabeling = NO;
+    id model = CallObject(keyplaneView, @"currentKeyplane");
+    if (model) {
+        ((void (*)(id, SEL, id))objc_msgSend)(keyplaneView, reset, model);
+        RefreshKeyViewHints(keyplaneView, 0);
+    }
 }
 
 static void hook_setShift(id self, SEL _cmd, BOOL shift) {
@@ -215,9 +265,10 @@ static void ScaleBottomArea(UIView *dock, double scale) {
     // empty padding (move the item, full size); only when it no longer fits between
     // the home-indicator clearance and the keys, shrink it just enough.
     const CGFloat homeClearance = 12, gapUnderKeys = 4;
+    // The gap's size: iOS 26 writes the constraint the other way round (+58, not -58).
     CGFloat strip = 0;
     for (NSLayoutConstraint *c in dock.superview.constraints)
-        if ([c.identifier isEqualToString:@"inputView.bottom"]) strip = -c.constant;
+        if ([c.identifier isEqualToString:@"inputView.bottom"]) strip = fabs(c.constant);
     for (UIView *item in dock.subviews) {
         CGAffineTransform t = CGAffineTransformIdentity;
         if (scale != 1 && strip > 0) {
@@ -280,6 +331,18 @@ static void hook_updateLocalizedKeys(id self, SEL _cmd, id keyplane) {
 static void (*orig_keyplaneLayoutSubviews)(id, SEL);
 static const NSInteger kHintTag = 0x5C10;
 
+static UILabel *NewHintLabel(void) {
+    UILabel *label = [UILabel new];
+    label.tag = kHintTag;
+    label.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+    label.adjustsFontSizeToFitWidth = YES;   // multi-character keys like ".com"
+    label.minimumScaleFactor = 0.5;
+    label.textColor = [UIColor.labelColor colorWithAlphaComponent:0.55];
+    label.textAlignment = NSTextAlignmentRight;
+    label.userInteractionEnabled = NO;
+    return label;
+}
+
 static void hook_keyplaneLayoutSubviews(UIView *self, SEL _cmd) {
     orig_keyplaneLayoutSubviews(self, _cmd);
     // This runs on every layout pass: reuse the labels from the last one.
@@ -296,14 +359,7 @@ static void hook_keyplaneLayoutSubviews(UIView *self, SEL _cmd) {
             if (label) {
                 [spare removeObjectAtIndex:0];
             } else {
-                label = [UILabel new];
-                label.tag = kHintTag;
-                label.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
-                label.adjustsFontSizeToFitWidth = YES;   // multi-character keys like ".com"
-                label.minimumScaleFactor = 0.5;
-                label.textColor = [UIColor.labelColor colorWithAlphaComponent:0.55];
-                label.textAlignment = NSTextAlignmentRight;
-                label.userInteractionEnabled = NO;
+                label = NewHintLabel();
                 [self addSubview:label];
             }
             if (![label.text isEqualToString:hint]) label.text = hint;
@@ -316,6 +372,45 @@ static void hook_keyplaneLayoutSubviews(UIView *self, SEL _cmd) {
     // Keep them above the key artwork if UIKit added views since the last pass.
     if (used.count && self.subviews.lastObject.tag != kHintTag)
         for (UILabel *label in used) [self bringSubviewToFront:label];
+}
+
+// iOS 26 (TextInputUI) gives every key a view of its own (TUIKBKeyView, laid out with Auto
+// Layout) and never uses UIKBKeyplaneView, so the hint goes on the key's view. (Keys can
+// show a second string natively, but only as iPad-style flick keys: drawn over the main
+// label, and swiping down types it.) The keycap is drawn inset in the view, about 1pt from
+// its top and 4pt from its right edge; the hint sits in that corner like the old one.
+static void (*orig_keyViewLayoutSubviews)(id, SEL);
+
+static void UpdateKeyViewHint(UIView *keyView) {
+    id key = CallObject(keyView, @"key");
+    NSString *hint = [TPRConfig current].symbolHints ? TPRProperties(key)[@"TPRhint"] : nil;
+    UILabel *label = nil;
+    for (UIView *v in keyView.subviews)
+        if (v.tag == kHintTag && [v isKindOfClass:[UILabel class]]) label = (UILabel *)v;
+    if (![hint isKindOfClass:[NSString class]]) {
+        [label removeFromSuperview];   // a key without a hint now (relabeled, or hints turned off)
+        return;
+    }
+    if (!label) [keyView addSubview:(label = NewHintLabel())];
+    if (![label.text isEqualToString:hint]) label.text = hint;
+    CGRect target = CGRectMake(CGRectGetMaxX(keyView.bounds) - 24.5, 3, 16, 13);
+    if (!CGRectEqualToRect(label.frame, target)) label.frame = target;
+    if (keyView.subviews.lastObject != label) [keyView bringSubviewToFront:label];
+}
+
+static void hook_keyViewLayoutSubviews(UIView *self, SEL _cmd) {
+    orig_keyViewLayoutSubviews(self, _cmd);
+    UpdateKeyViewHint(self);
+}
+
+// After keys changed in place (the auto-capitalized row), which needn't lay their views out again.
+static void RefreshKeyViewHints(UIView *view, int depth) {
+    if ([view isKindOfClass:NSClassFromString(@"TUIKBKeyView")]) {
+        UpdateKeyViewHint(view);
+        return;
+    }
+    if (depth < 8)
+        for (UIView *child in view.subviews) RefreshKeyViewHints(child, depth + 1);
 }
 
 // ---- NewTerm: a SwiftUI view that never settles ---------------------------------------
@@ -334,6 +429,163 @@ static void hook_setConstant(NSLayoutConstraint *self, SEL _cmd, CGFloat constan
         [NSStringFromClass(object_getClass(self.firstItem)) hasPrefix:@"_TtGC7SwiftUI14_UIHostingView"])
         return;
     orig_setConstant(self, _cmd, constant);
+}
+
+// ---- iOS 26 dynamic keyboards: height and orientation ------------------------------------
+// TextInputUI sizes a dynamic keyboard from the screen and the layout's base height
+// (+[TUIKeyplane sizeFromScreenTraits:layout:layoutClass:]) and splits that height between
+// its rows, so an added row would squeeze the others. Grow the height by the rows the
+// patcher added to that layout's keyboard (in that orientation), and apply Key Height.
+
+static CGSize (*orig_sizeFromScreenTraits)(id, SEL, id, id, long long);
+static CGSize (*orig_sizeFromScreenTraitsKeyplane)(id, SEL, id, id, id, long long);
+static CGSize (*orig_keyplaneSizeForLayout)(id, SEL, id, id, long long);
+static id (*orig_keyboardWithNameScreenTraits)(id, SEL, NSString *, id);
+static id (*orig_keyForKeyboardName)(id, SEL, NSString *, id);
+static long long gSizingKeyboardType = -1;   // main thread: the type +keyplaneSizeForLayout: asks about
+
+static BOOL ActiveInThisApp(TPRConfig *config) {
+    NSString *app = NSBundle.mainBundle.bundleIdentifier;
+    return config.enabled && !(app && [config.excludedApps containsObject:app]);
+}
+
+// Screen traits for a landscape keyboard: the orientation, or a keyboard wider than the
+// screen's short side (UIKit also sizes with portrait-oriented traits during a rotation).
+static BOOL TraitsAreLandscape(id traits) {
+    long long orientation = [traits respondsToSelector:@selector(orientation)]
+        ? ((long long (*)(id, SEL))objc_msgSend)(traits, @selector(orientation)) : 0;
+    if (UIInterfaceOrientationIsLandscape((UIInterfaceOrientation)orientation)) return YES;
+    SEL widthSel = NSSelectorFromString(@"keyboardWidth");
+    double width = [traits respondsToSelector:widthSel] ? ((double (*)(id, SEL))objc_msgSend)(traits, widthSel) : 0;
+    CGRect screen = UIScreen.mainScreen.fixedCoordinateSpace.bounds;
+    return width > MIN(screen.size.width, screen.size.height) + 1;
+}
+
+static CGSize hook_keyplaneSizeForLayout(id self, SEL _cmd, id layout, id traits, long long keyboardType) {
+    long long saved = gSizingKeyboardType;
+    gSizingKeyboardType = keyboardType;
+    CGSize size = orig_keyplaneSizeForLayout(self, _cmd, layout, traits, keyboardType);
+    gSizingKeyboardType = saved;
+    return size;
+}
+
+static CGSize DynamicKeyboardSize(CGSize size, id layout, long long layoutClass) {
+    // iPhone keyboards are layout class 1 ("Small"). A keyplane view that doesn't have its
+    // keyplane yet asks for class 0 first; other classes are iPad sizes.
+    TPRConfig *config = [TPRConfig current];
+    if (layoutClass != 1 || size.height <= 0 || !ActiveInThisApp(config)) return size;
+    long long type = gSizingKeyboardType;
+    if (type < 0) {   // the keyboard on screen
+        id inputTraits = CallObject(CallObject(NSClassFromString(@"UIKeyboardImpl"), @"activeInstance"), @"textInputTraits");
+        type = [inputTraits respondsToSelector:@selector(keyboardType)] ? (long long)[inputTraits keyboardType] : 0;
+    }
+    // UIKit's own orientation decision, from the shape it chose (portrait ~1.5-1.9, landscape > 3).
+    BOOL landscape = size.width / size.height > 2.4;
+    double factor = TPRDynamicHeightFactor(layout, (NSInteger)type, landscape, config);
+    if (factor > 0.5 && factor < 3 && fabs(factor - 1) > 0.001) size.height = round(size.height * factor);
+    return size;
+}
+
+static CGSize hook_sizeFromScreenTraits(id self, SEL _cmd, id traits, id layout, long long layoutClass) {
+    return DynamicKeyboardSize(orig_sizeFromScreenTraits(self, _cmd, traits, layout, layoutClass), layout, layoutClass);
+}
+
+// iOS 27 also passes the keyplane's name (and calls the layout "keyboardName").
+static CGSize hook_sizeFromScreenTraitsKeyplane(id self, SEL _cmd, id traits, id layout, id keyplane, long long layoutClass) {
+    return DynamicKeyboardSize(orig_sizeFromScreenTraitsKeyplane(self, _cmd, traits, layout, keyplane, layoutClass),
+                               layout, layoutClass);
+}
+
+// UIKit loads a keyboard for the screen traits it has at the time (and keeps it, under
+// -keyForKeyboardName:screenTraits:, for both orientations). Tell the patcher which one.
+static id hook_keyboardWithNameScreenTraits(id self, SEL _cmd, NSString *name, id traits) {
+    BOOL saved = gLoadingLandscape;
+    gLoadingLandscape = TraitsAreLandscape(traits);
+    id keyboard = orig_keyboardWithNameScreenTraits(self, _cmd, name, traits);
+    gLoadingLandscape = saved;
+    return keyboard;
+}
+
+// The key UIKeyboardLayoutStar caches a loaded keyboard under is the same in both
+// orientations for dynamic keyboards, so a rotation reuses the tree. When landscape is
+// meant to differ, give landscape its own key: rotating then loads the landscape copy.
+static BOOL IsLandscapeDynamicCopy(id layoutStar, NSString *keyboardName, id traits) {
+    TPRConfig *config = [TPRConfig current];
+    return orig_keyForKeyboardName && [keyboardName isKindOfClass:[NSString class]] && [keyboardName hasPrefix:@"Dynamic-"] &&
+           config.landscapeDiffers && ActiveInThisApp(config) && TraitsAreLandscape(traits);
+}
+
+static id hook_keyForKeyboardName(id self, SEL _cmd, NSString *name, id traits) {
+    id key = orig_keyForKeyboardName(self, _cmd, name, traits);
+    if ([key isKindOfClass:[NSString class]] && IsLandscapeDynamicCopy(self, name, traits))
+        key = [key stringByAppendingString:@"-TopRowLandscape"];
+    return key;
+}
+
+// On rotation UIKit calls -setKeyboardName:appearance: again, but keeps its keyboard when
+// the name (and appearance, type) didn't change, as a dynamic keyboard's doesn't. If the
+// layout's keyboard was loaded for the other orientation's copy, forget the name first so
+// UIKit takes the new-keyboard path (the copy comes from its cache, by the key above).
+static void (*orig_setKeyboardNameAppearance)(id, SEL, NSString *, long long);
+static char kLoadedLandscapeKey;
+
+static void hook_setKeyboardNameAppearance(id self, SEL _cmd, NSString *name, long long appearance) {
+    BOOL landscape = IsLandscapeDynamicCopy(self, name, CallObject(self, @"screenTraits"));
+    NSNumber *loaded = objc_getAssociatedObject(self, &kLoadedLandscapeKey);
+    static Ivar nameIvar;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ nameIvar = class_getInstanceVariable(NSClassFromString(@"UIKeyboardLayoutStar"), "_keyboardName"); });
+    if (loaded && loaded.boolValue != landscape && nameIvar && [name isEqual:object_getIvar(self, nameIvar)])
+        object_setIvarWithStrongDefault(self, nameIvar, nil);
+    orig_setKeyboardNameAppearance(self, _cmd, name, appearance);
+    objc_setAssociatedObject(self, &kLoadedLandscapeKey, @(landscape), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// A class method of `className` returning a CGSize, taking `arguments` arguments (with self and _cmd).
+static Method SizeMethod(NSString *className, NSString *selName, unsigned arguments) {
+    Class cls = NSClassFromString(className);
+    Method method = cls ? class_getClassMethod(cls, NSSelectorFromString(selName)) : NULL;
+    if (!method || method_getNumberOfArguments(method) != arguments) return NULL;
+    char *returns = method_copyReturnType(method);
+    BOOL size = returns && !strncmp(returns, "{CGSize=", 8);
+    free(returns);
+    return size ? method : NULL;
+}
+
+// Dynamic keyboards get the row only if this works: an added row without it squeezes them all.
+static BOOL HookDynamicSizing(void) {
+    Method typeMethod = SizeMethod(@"TUIKeyplaneView", @"keyplaneSizeForLayout:screenTraits:keyboardType:", 5);
+    Method sizeMethod = SizeMethod(@"TUIKeyplane", @"sizeFromScreenTraits:layout:layoutClass:", 5);
+    Method keyplaneSizeMethod = sizeMethod ? NULL                                     // iOS 27:
+        : SizeMethod(@"TUIKeyplane", @"sizeFromScreenTraits:keyboardName:keyplaneName:layoutClass:", 6);
+    if (!typeMethod || (!sizeMethod && !keyplaneSizeMethod)) return NO;
+    orig_keyplaneSizeForLayout = (CGSize (*)(id, SEL, id, id, long long))method_setImplementation(
+        typeMethod, (IMP)hook_keyplaneSizeForLayout);
+    if (sizeMethod)
+        orig_sizeFromScreenTraits = (CGSize (*)(id, SEL, id, id, long long))method_setImplementation(
+            sizeMethod, (IMP)hook_sizeFromScreenTraits);
+    else
+        orig_sizeFromScreenTraitsKeyplane = (CGSize (*)(id, SEL, id, id, id, long long))method_setImplementation(
+            keyplaneSizeMethod, (IMP)hook_sizeFromScreenTraitsKeyplane);
+    return YES;
+}
+
+// Orientation of dynamic keyboards (Show in Landscape off, landscape rows): all or nothing.
+static void HookDynamicOrientation(void) {
+    Class starClass = NSClassFromString(@"UIKeyboardLayoutStar");
+    Method loadMethod = class_getClassMethod(starClass, NSSelectorFromString(@"keyboardWithName:screenTraits:"));
+    Method keyMethod = class_getInstanceMethod(starClass, NSSelectorFromString(@"keyForKeyboardName:screenTraits:"));
+    Method nameMethod = class_getInstanceMethod(starClass, NSSelectorFromString(@"setKeyboardName:appearance:"));
+    if (!loadMethod || !keyMethod || !nameMethod || !class_getInstanceVariable(starClass, "_keyboardName")) {
+        TPRLog(@"landscape hooks missing on this iOS");
+        return;
+    }
+    orig_keyboardWithNameScreenTraits = (id (*)(id, SEL, NSString *, id))method_setImplementation(
+        loadMethod, (IMP)hook_keyboardWithNameScreenTraits);
+    orig_keyForKeyboardName = (id (*)(id, SEL, NSString *, id))method_setImplementation(
+        keyMethod, (IMP)hook_keyForKeyboardName);
+    orig_setKeyboardNameAppearance = (void (*)(id, SEL, NSString *, long long))method_setImplementation(
+        nameMethod, (IMP)hook_setKeyboardNameAppearance);
 }
 
 static Method TargetMethod(NSString *className, SEL sel) {
@@ -378,11 +630,29 @@ static NSString *OwnUUID(void) {
     return @"?";
 }
 
+// The filter (Bundles = com.apple.UIKit) loads us into anything with UIKit loaded, including
+// command-line tools and daemons, and ElleKit filters can't exclude processes, so this decides.
 static BOOL ShouldLoadInProcess(void) {
     char exe[PATH_MAX];
     uint32_t size = sizeof(exe);
-    if (_NSGetExecutablePath(exe, &size) != 0 || !strstr(exe, ".app/")) return NO;   // not daemons
-    if (!strstr(exe, ".appex/")) return YES;   // real apps, incl. SpringBoard, InputUI, Spotlight
+    if (_NSGetExecutablePath(exe, &size) != 0) return NO;
+    const char *slash = strrchr(exe, '/');
+    if (!slash) return NO;
+    size_t dirLength = (size_t)(slash - exe);
+    BOOL app = dirLength > 4 && !strncmp(slash - 4, ".app", 4);
+    BOOL appex = dirLength > 6 && !strncmp(slash - 6, ".appex", 6);
+    // Only an executable directly inside a .app or .appex (iOS bundles are flat): not
+    // command-line tools, daemons, or XPC services nested in an app.
+    if (!app && !appex) return NO;
+    // Apple daemons wrapped in .app bundles inside frameworks (imagent, sociallayerd, IDS
+    // agents, ...). Only .app: share sheets and other extensions live in frameworks' PlugIns.
+    if (app && memmem(exe, dirLength, ".framework/", 11)) return NO;
+    // A helper tool next to an app's own executable (trollstorehelper): its main bundle is the
+    // app, so it has to be the executable the app declares.
+    NSString *declared = NSBundle.mainBundle.infoDictionary[@"CFBundleExecutable"];
+    if (![declared isKindOfClass:[NSString class]] || strcasecmp(declared.fileSystemRepresentation, slash + 1) != 0)
+        return NO;
+    if (app) return YES;   // real apps, incl. SpringBoard, InputUI, Spotlight
     // Extensions: only share sheets, action extensions and password managers' AutoFill
     // sheets (their text fields use the stock keyboard in-process). Never custom
     // keyboards, widgets, etc.
@@ -418,6 +688,17 @@ __attribute__((constructor)) static void TPRInit(void) {
         if (TargetMethod(@"UIKBKeyplaneView", @selector(layoutSubviews)))
             HookMethod(@"UIKBKeyplaneView", @selector(layoutSubviews), (IMP)hook_keyplaneLayoutSubviews,
                        (IMP *)&orig_keyplaneLayoutSubviews);
+        // iOS 26 lays out every iPhone keyboard with TextInputUI ("dynamic" keyboards). Earlier
+        // versions do that for a few minority layouts, which stay Apple's.
+        if ([NSProcessInfo.processInfo isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){26, 0, 0}]) {
+            BOOL sized = HookDynamicSizing();
+            TPRSetDynamicKeyboardsUnsupported(sized ? nil : @"dynamic keyboard: no height hook on this iOS");
+            if (!sized) TPRLog(@"height hook missing on this iOS");
+            HookDynamicOrientation();
+            if (TargetMethod(@"TUIKBKeyView", @selector(layoutSubviews)))
+                HookMethod(@"TUIKBKeyView", @selector(layoutSubviews), (IMP)hook_keyViewLayoutSubviews,
+                           (IMP *)&orig_keyViewLayoutSubviews);
+        }
         SEL localizeSel = NSSelectorFromString(@"updateLocalizedKeysOnKeyplane:");
         if (TargetMethod(@"UIKeyboardLayoutStar", localizeSel))
             HookMethod(@"UIKeyboardLayoutStar", localizeSel, (IMP)hook_updateLocalizedKeys, (IMP *)&orig_updateLocalizedKeys);

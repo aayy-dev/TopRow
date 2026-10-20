@@ -28,6 +28,9 @@ static const int kMaxDepth = 24;
 
 static id DeepCopy(id obj, NSMapTable *copies, NSUInteger *budget, int depth);
 
+// Set while copying an iOS 26 dynamic keyboard (only under TPRPatchKeyboard's lock).
+static BOOL gCopyingDynamic;
+
 static NSMutableArray *DeepCopyArray(NSArray *array, NSMapTable *copies, NSUInteger *budget, int depth) {
     NSMutableArray *out = [NSMutableArray arrayWithCapacity:array.count];
     for (id item in array) {
@@ -85,6 +88,9 @@ static id DeepCopy(id obj, NSMapTable *copies, NSUInteger *budget, int depth) {
     if (TPRName(obj)) [copy setName:TPRName(obj)];
     NSMutableDictionary *props = DeepCopy(TPRProperties(obj) ?: @{}, copies, budget, depth + 1);
     NSMutableArray *subtrees = DeepCopyArray(TPRSubtrees(obj) ?: @[], copies, budget, depth + 1);
+    // iOS 26 (TextInputUI) treats a key with an empty subtrees array as having long-press
+    // variants and reads the first one, so in dynamic keyboards nil stays nil.
+    BOOL keepNil = gCopyingDynamic && !TPRSubtrees(obj);
     // Keyplanes arrive with a cache indexing their special keys by name (More-Key,
     // Shift-Key, currency signs, ...); UIKit relabels and hides keys through it, so it
     // must point at the copied keys rather than be dropped.
@@ -93,8 +99,8 @@ static id DeepCopy(id obj, NSMapTable *copies, NSUInteger *budget, int depth) {
         ? DeepCopy(cache, copies, budget, depth + 1) : [NSMutableDictionary dictionary];
     if (!props || !subtrees || !cacheCopy) return nil;
     [copy setProperties:props];
-    [copy setSubtrees:subtrees];
-    [copy setCache:cacheCopy];
+    [copy setSubtrees:keepNil ? nil : subtrees];
+    [copy setCache:gCopyingDynamic && ![cache isKindOfClass:[NSDictionary class]] ? nil : cacheCopy];
     return copy;
 }
 
@@ -296,6 +302,284 @@ static NSString *PatchPlane(id plane, NSArray<NSString *> *labels, NSArray<NSStr
     for (id node in @[ keyset, geometrySet ])
         [(id<TPRKBTree>)node setName:[NSString stringWithFormat:@"%@-TPR%@", TPRName(node), fingerprint]];
     *pitchOut = pitch;
+    return nil;
+}
+
+// ---- dynamic keyboards (iOS 26) ---------------------------------------------------------
+//
+// iOS 26 iPhone keyboards ("Dynamic-QWERTY-Small", KBdynamic = 1) carry no geometry. A
+// keyplane's key layout lists its rows in row sets, one per keyboard type:
+//
+//   [2] keyplane
+//     [3] key layout (KBdynamic, DynamicKeyset, per-type dicts)
+//       [15] row set "..._Default" (KBRowSetVariantType 0)
+//         [7] "Keylist.Row1.Layout"  ─ [8] padding, [7] keyset row ─ [8] keys, [8] padding
+//         [7] "Keylist.Row2.Layout"  ...
+//         [7] "Keylist.Row3.Layout"  (Shift, padding, keys, padding, Delete)
+//         [4] "Space-Row-Small"
+//       [15] row set "..._EmailAddress" / URL / Twitter / ... ─ [4] its own space row
+//       [6] attribute set
+//
+// -[UIKBTree orderedRowsForType:] takes the Default row set's rows and lets a type's row
+// set replace the last ones (its space row), and TextInputUI's TUIKeyplane builds one
+// row of keys per entry, sizing keys by relative widths (row properties like
+// "Shift-Key" = "1.3") and rows by -heightMultiplierForRowNumber:. So the extra row is a
+// new row layout in the Default row set, built like Apple's first row, and every
+// keyboard type inherits it. The keyboard height comes from +[TUIKeyplane
+// sizeFromScreenTraits:layout:layoutClass:] (Tweak.m makes room for the extra row).
+
+BOOL TPRIsDynamicKeyboard(id keyboard) {
+    return [TPRProperties(keyboard)[@"KBdynamic"] boolValue];
+}
+
+// Set once, from the dylib constructor.
+static NSString *gDynamicUnsupported = @"dynamic keyboard before iOS 26";
+
+void TPRSetDynamicKeyboardsUnsupported(NSString *reason) {
+    gDynamicUnsupported = [reason copy];
+}
+
+static NSInteger RowSetType(id node) {
+    id type = TPRProperties(node)[@"KBRowSetVariantType"];
+    return [type respondsToSelector:@selector(integerValue)] ? [type integerValue] : -1;
+}
+
+// The plane's character key layout and its Default row set.
+static BOOL FindDynamicRowSet(id plane, id *layoutOut, id *rowSetOut) {
+    for (id layout in TPRSubtrees(plane)) {
+        if (TPRType(layout) != TPRNodeKeylayout || ![TPRProperties(layout)[@"KBdynamic"] boolValue]) continue;
+        id first = nil, zero = nil;
+        for (id child in TPRSubtrees(layout)) {
+            if (TPRType(child) != 15) continue;
+            if (!first) first = child;
+            if (RowSetType(child) == 0 && !zero) zero = child;
+        }
+        id rowSet = zero ?: first;
+        if (!rowSet) continue;
+        *layoutOut = layout;
+        *rowSetOut = rowSet;
+        return YES;
+    }
+    return NO;
+}
+
+// The keyset row (the character keys) inside a row layout, if it has one.
+static id DynamicKeysetRow(id rowLayout) {
+    for (id child in TPRSubtrees(rowLayout))
+        if (TPRType(child) == TPRNodeList) return child;
+    return nil;
+}
+
+// Dynamic keyboards (iOS 26) have no frames to place keys with: a row's keys share its
+// width by relative units. -[TUIKeyplane multiplierForKey:withProperties:] looks a key up
+// in its row layout's properties by name, then by represented string, then (names like
+// "2_Padding-Left") by the name past the prefix; a value naming another property
+// ("Padding-Right" = "Padding-Left") is looked up once more; 1 when there's none. The keys
+// of a keyset row inside a row layout all take the key layout's value for the keyset row's
+// name from "Row" on, when it has one ("Row3" = "1.4" on the 123 pages).
+
+static NSString *DynamicWidthProperty(id key, NSDictionary *props) {
+    NSString *name = TPRName(key), *typed = TPRProperties(key)[@"KBrepresentedString"];
+    if (name && props[name]) return name;
+    if ([typed isKindOfClass:[NSString class]] && props[typed]) return typed;
+    if ([name rangeOfString:@"_"].location == 1 && props[[name substringFromIndex:2]]) return [name substringFromIndex:2];
+    return nil;
+}
+
+static double DynamicWidth(id key, NSDictionary *props) {
+    NSString *prop = DynamicWidthProperty(key, props);
+    id value = prop ? props[prop] : nil;
+    if (value && props[value]) value = props[value];
+    return [value respondsToSelector:@selector(doubleValue)] ? [value doubleValue] : 1;
+}
+
+static NSString *KeysetWidthProperty(id keysetRow, NSDictionary *layoutProps) {
+    NSString *name = TPRName(keysetRow);
+    NSRange row = [name rangeOfString:@"Row"];
+    if (row.location != NSNotFound && layoutProps[[name substringFromIndex:row.location]]) return [name substringFromIndex:row.location];
+    if (name && layoutProps[name]) return name;
+    return row.location != NSNotFound ? [name substringFromIndex:row.location] : name;
+}
+
+static BOOL IsPaddingKey(id key) {
+    return TPRType(key) == TPRNodeKey && [TPRProperties(key)[@"KBrepresentedString"] hasPrefix:@"Padding-"];
+}
+
+// A key layout can override a row's properties by row number ("Rowset.Row4",
+// "Rowset.EmailAddress.Row4"; numbered from 1). After a row is inserted at index `row`, the
+// rows below it are one further down. (No iPhone layout TopRow patches on iOS 26.0-26.3 has any.)
+static NSMutableDictionary *RenumberRowOverrides(NSMutableDictionary *props, NSUInteger row) {
+    NSRegularExpression *pattern = [NSRegularExpression regularExpressionWithPattern:@"^(Rowset\\.(?:[^.]+\\.)?Row)(\\d+)$"
+                                                                             options:0 error:NULL];
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:props.count];
+    for (NSString *key in props) {
+        NSTextCheckingResult *match = [key isKindOfClass:[NSString class]]
+            ? [pattern firstMatchInString:key options:0 range:NSMakeRange(0, key.length)] : nil;
+        NSInteger number = match ? [key substringWithRange:[match rangeAtIndex:2]].integerValue : 0;
+        NSString *renumbered = match && number > (NSInteger)row
+            ? [NSString stringWithFormat:@"%@%ld", [key substringWithRange:[match rangeAtIndex:1]], (long)number + 1] : key;
+        out[renumbered] = props[key];
+    }
+    return out;
+}
+
+static NSString *PatchDynamicPlane(id plane, NSArray<NSString *> *labels, NSArray<NSString *> *hints, NSUInteger row,
+                                   NSString *fingerprint) {
+    id layout, rowSet;
+    if (!FindDynamicRowSet(plane, &layout, &rowSet)) return @"no dynamic row set";
+    NSArray *rows = TPRSubtrees(rowSet);
+    if (rows.count < MAX(3, row + 1)) return @"too few rows";
+    id template = rows[0];   // Apple's first row spans the keyboard (no edge padding)
+    id keysetRow = DynamicKeysetRow(template);
+    NSArray *oldKeys = TPRSubtrees(keysetRow);
+    if (TPRType(template) != TPRNodeList || oldKeys.count < 8) return @"no full-width key row";
+    for (id key in oldKeys)
+        if (TPRType(key) != TPRNodeKey) return @"unexpected key row";
+
+    // The units Apple's row fills: its keyset row, keys beside it (QWERTZ's Ü) and paddings.
+    // The new row has to fill the same, or TextInputUI can't lay it out and its keys end up
+    // with no width.
+    NSMutableDictionary *layoutProps = [TPRProperties(layout) mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSDictionary *templateProps = TPRProperties(template) ?: @{};
+    id shared = layoutProps[KeysetWidthProperty(keysetRow, layoutProps) ?: @""];
+    double keyUnits = 0, otherUnits = 0;
+    BOOL otherKeys = NO;
+    for (id key in oldKeys)
+        keyUnits += [shared respondsToSelector:@selector(doubleValue)] ? [shared doubleValue] : DynamicWidth(key, templateProps);
+    for (id child in TPRSubtrees(template)) {
+        if (child == keysetRow || TPRType(child) != TPRNodeKey) continue;
+        otherUnits += DynamicWidth(child, templateProps);
+        if (!IsPaddingKey(child)) otherKeys = YES;
+    }
+    if (keyUnits <= 0) return @"key row has no width";
+
+    NSUInteger count = labels.count;
+    NSUInteger rowTag = [labels componentsJoinedByString:@"\x1f"].hash;
+    NSMutableArray *newKeys = [NSMutableArray array];
+    for (NSUInteger i = 0; i < count; i++) {
+        // Same position in Apple's row where there is one (its display corner, popup side).
+        id donor = oldKeys[MIN(count == oldKeys.count ? i : i * oldKeys.count / count, oldKeys.count - 1)];
+        id<TPRKBTree> key = [donor copy];
+        if (!key || key == donor) return @"donor key copy failed";
+        NSMutableDictionary *props = [TPRProperties(donor) mutableCopy];
+        props[@"KBdisplayString"] = labels[i];
+        props[@"KBrepresentedString"] = labels[i];
+        props[@"KBdisplayType"] = @0;   // a plain key, even under a currency key
+        [props removeObjectForKey:@"variant-type"];
+        [props removeObjectForKey:@"KBlocalizationKey"];
+        [props removeObjectForKey:@"KBshape"];
+        if (hints.count == count) props[@"TPRhint"] = hints[i];
+        [key setProperties:props];
+        [key setName:[NSString stringWithFormat:@"TopRow-%lx-Key-%lu", (unsigned long)rowTag, (unsigned long)i]];
+        [key setCache:[NSMutableDictionary dictionary]];
+        [key setSubtrees:nil];   // no long-press list (an empty one crashes on touch)
+        [newKeys addObject:key];
+    }
+
+    id<TPRKBTree> newKeyset = [keysetRow copy];
+    id<TPRKBTree> newRow = [template copy];
+    if (!newKeyset || newKeyset == keysetRow || !newRow || newRow == template) return @"row copy failed";
+    NSString *tag = [NSString stringWithFormat:@"TopRow-%@", fingerprint];
+    NSMutableDictionary *keysetProps = [TPRProperties(keysetRow) mutableCopy] ?: [NSMutableDictionary dictionary];
+    if (keysetProps[@"Alias"]) keysetProps[@"Alias"] = [NSString stringWithFormat:@"%@_Keyset", tag];
+    [newKeyset setProperties:keysetProps];
+    [newKeyset setName:[NSString stringWithFormat:@"%@_Keyset", tag]];
+    [newKeyset setSubtrees:newKeys];
+    [newKeyset setCache:[NSMutableDictionary dictionary]];
+
+    // The row layout: Apple's padding keys around the new keys. Apple's other keys stay out:
+    // a key in two rows is taken for one spanning both.
+    NSMutableArray *rowItems = [NSMutableArray array];
+    for (id child in TPRSubtrees(template))
+        if (child == keysetRow || IsPaddingKey(child)) [rowItems addObject:child == keysetRow ? newKeyset : child];
+    NSMutableDictionary *rowProps = [templateProps mutableCopy];
+    if (rowProps[@"Alias"]) rowProps[@"Alias"] = [NSString stringWithFormat:@"%@_Row", tag];
+    // As many keys as Apple's keyset row (and nothing beside it): its columns. Otherwise the
+    // keys share the whole row.
+    BOOL mirror = count == oldKeys.count && !otherKeys;
+    if (!mirror)
+        for (id child in rowItems)
+            if (child != newKeyset)
+                rowProps[DynamicWidthProperty(child, rowProps) ?: TPRProperties(child)[@"KBrepresentedString"]] = @"0";
+    layoutProps[KeysetWidthProperty(newKeyset, layoutProps)] =
+        [NSString stringWithFormat:@"%.6f", (mirror ? keyUnits : keyUnits + otherUnits) / count];
+    [newRow setProperties:rowProps];
+    [newRow setName:[NSString stringWithFormat:@"%@_Row", tag]];
+    [newRow setSubtrees:rowItems];
+    [newRow setCache:[NSMutableDictionary dictionary]];
+
+    // The layout's attribute set has one entry per row (UIKit walks them together): give
+    // the new row an empty one, like Apple's first row has.
+    id attributeSet = TPRChildOfType(layout, TPRNodeAttributeSet);
+    NSArray *attrRows = TPRSubtrees(attributeSet);
+    if (attrRows.count != rows.count || TPRType(attrRows[0]) != TPRNodeList) return @"attribute rows don't match";
+    id<TPRKBTree> emptyAttrs = [attrRows[0] copy];
+    if (!emptyAttrs || emptyAttrs == attrRows[0]) return @"attribute copy failed";
+    [emptyAttrs setName:@"Empty_Attribute_List"];
+    [emptyAttrs setProperties:[NSMutableDictionary dictionary]];
+    // Empty like Apple's (nil subtrees stay nil, see DeepCopy).
+    [emptyAttrs setSubtrees:TPRSubtrees(attrRows[0]).count ? [NSMutableArray array] : [TPRSubtrees(attrRows[0]) mutableCopy]];
+    NSMutableArray *newAttrs = [attrRows mutableCopy];
+    [newAttrs insertObject:emptyAttrs atIndex:row];
+
+    NSMutableArray *newRows = [rows mutableCopy];
+    [newRows insertObject:newRow atIndex:row];
+    [(id<TPRKBTree>)rowSet setSubtrees:newRows];
+    [(id<TPRKBTree>)attributeSet setSubtrees:newAttrs];
+    [(id<TPRKBTree>)layout setProperties:RenumberRowOverrides(layoutProps, row)];
+    return nil;
+}
+
+// A keyboard's planes share one height on iOS 26 (it's sized per layout, not per plane), so
+// a plane without the extra row (none set for it, or one that didn't fit) would have its rows
+// stretched into the room the row takes elsewhere. It gets an empty band on top instead: a
+// row of Apple's padding keys alone, filling the row's units (no keys to draw or press).
+static NSString *InsertDynamicSpacer(id plane, NSString *fingerprint) {
+    id layout, rowSet;
+    if (!FindDynamicRowSet(plane, &layout, &rowSet)) return @"no dynamic row set";
+    NSArray *rows = TPRSubtrees(rowSet);
+    id template = rows.count >= 3 ? rows[0] : nil;
+    id keysetRow = DynamicKeysetRow(template);
+    NSArray *oldKeys = TPRSubtrees(keysetRow);
+    if (TPRType(template) != TPRNodeList || !oldKeys.count) return @"no key row";
+    NSDictionary *layoutProps = TPRProperties(layout) ?: @{}, *templateProps = TPRProperties(template) ?: @{};
+    id shared = layoutProps[KeysetWidthProperty(keysetRow, layoutProps) ?: @""];
+    double units = 0;
+    for (id key in oldKeys)
+        units += [shared respondsToSelector:@selector(doubleValue)] ? [shared doubleValue] : DynamicWidth(key, templateProps);
+    for (id child in TPRSubtrees(template))
+        if (child != keysetRow && TPRType(child) == TPRNodeKey) units += DynamicWidth(child, templateProps);
+    NSMutableArray *rowItems = [NSMutableArray array];
+    NSMutableDictionary *rowProps = [templateProps mutableCopy];
+    for (id child in TPRSubtrees(template))
+        if (IsPaddingKey(child)) [rowItems addObject:child];
+    if (!rowItems.count) return @"no padding keys";
+    for (id pad in rowItems)
+        rowProps[DynamicWidthProperty(pad, rowProps) ?: TPRProperties(pad)[@"KBrepresentedString"]] =
+            [NSString stringWithFormat:@"%.6f", units / rowItems.count];
+    NSString *name = [NSString stringWithFormat:@"TopRow-%@_Spacer", fingerprint];
+    if (rowProps[@"Alias"]) rowProps[@"Alias"] = name;
+    id<TPRKBTree> newRow = [template copy];
+    if (!newRow || newRow == template) return @"spacer copy failed";
+    [newRow setProperties:rowProps];
+    [newRow setName:name];
+    [newRow setSubtrees:rowItems];
+    [newRow setCache:[NSMutableDictionary dictionary]];
+
+    id attributeSet = TPRChildOfType(layout, TPRNodeAttributeSet);
+    NSArray *attrRows = TPRSubtrees(attributeSet);
+    if (attrRows.count != rows.count || TPRType(attrRows[0]) != TPRNodeList) return @"attribute rows don't match";
+    id<TPRKBTree> emptyAttrs = [attrRows[0] copy];
+    if (!emptyAttrs || emptyAttrs == attrRows[0]) return @"attribute copy failed";
+    [emptyAttrs setName:@"Empty_Attribute_List"];
+    [emptyAttrs setProperties:[NSMutableDictionary dictionary]];
+    [emptyAttrs setSubtrees:TPRSubtrees(attrRows[0]).count ? [NSMutableArray array] : [TPRSubtrees(attrRows[0]) mutableCopy]];
+    NSMutableArray *newAttrs = [attrRows mutableCopy], *newRows = [rows mutableCopy];
+    [newAttrs insertObject:emptyAttrs atIndex:0];
+    [newRows insertObject:newRow atIndex:0];
+    [(id<TPRKBTree>)rowSet setSubtrees:newRows];
+    [(id<TPRKBTree>)attributeSet setSubtrees:newAttrs];
+    [(id<TPRKBTree>)layout setProperties:RenumberRowOverrides([layoutProps mutableCopy], 0)];
     return nil;
 }
 
@@ -515,6 +799,158 @@ static void PruneKeyCache(id plane, NSHashTable *removed) {
     [(id<TPRKBTree>)plane setCache:cache];
 }
 
+// Apple's three character rows of a dynamic plane, as indexes into its Default row set:
+// row layouts holding a keyset row, TopRow's own row left out.
+static NSArray<NSNumber *> *DynamicCharacterRows(id rowSet) {
+    NSMutableArray *rows = [NSMutableArray array];
+    NSArray *all = TPRSubtrees(rowSet);
+    for (NSUInteger i = 0; i < all.count; i++)
+        if (TPRType(all[i]) == TPRNodeList && ![TPRName(all[i]) hasPrefix:@"TopRow-"] && DynamicKeysetRow(all[i]))
+            [rows addObject:@(i)];
+    return rows;
+}
+
+static BOOL IsStockDynamicPlane(id plane, TPRKeyPlane kind) {
+    id layout, rowSet;
+    if (!FindDynamicRowSet(plane, &layout, &rowSet)) return NO;
+    NSArray<NSNumber *> *rows = DynamicCharacterRows(rowSet);
+    if (rows.count != TPRKeyRowCount) return NO;
+    for (NSUInteger row = 0; row < TPRKeyRowCount; row++) {
+        NSMutableArray *typed = [NSMutableArray array];
+        for (id key in TPRSubtrees(DynamicKeysetRow(TPRSubtrees(rowSet)[rows[row].unsignedIntegerValue]))) {
+            id represented = TPRProperties(key)[@"KBrepresentedString"];
+            if (TPRType(key) != TPRNodeKey || ![represented isKindOfClass:[NSString class]]) return NO;
+            [typed addObject:represented];
+        }
+        if (![typed isEqualToArray:TPRSplitKeys(TPRStockKeySignature(kind, row))]) return NO;
+    }
+    return YES;
+}
+
+// CustomizeRow for a dynamic plane: `rowLayout` is Apple's row (padding keys around a keyset
+// row, maybe Shift and Delete outside them), `attrRow` its entry in the attribute set. The
+// row keeps its total units: keys keep Apple's width while they fit between the paddings,
+// centered by them, and share that space evenly (no padding) when they don't.
+static NSString *CustomizeDynamicRow(id layout, id rowLayout, id attrRow, NSUInteger row, TPRKeyPlane kind,
+                                     NSArray<NSString *> *labels, NSHashTable *removed) {
+    id keysetRow = DynamicKeysetRow(rowLayout);
+    NSArray *children = TPRSubtrees(rowLayout), *stockKeys = TPRSubtrees(keysetRow);
+    NSArray<NSString *> *defaults = TPRSplitKeys(TPRStockKeyRow(kind, row));
+    if (!stockKeys.count || stockKeys.count != defaults.count) return @"unexpected row";
+    NSUInteger at = [children indexOfObjectIdenticalTo:keysetRow];
+    if (at == 0 || at + 1 >= children.count || !IsPaddingKey(children[at - 1]) || !IsPaddingKey(children[at + 1]))
+        return @"no padding around the keys";
+
+    // Units Apple's keys and the paddings next to them take.
+    NSMutableDictionary *layoutProps = [TPRProperties(layout) mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSMutableDictionary *rowProps = [TPRProperties(rowLayout) mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSString *keysProp = KeysetWidthProperty(keysetRow, layoutProps);
+    if (!keysProp) return @"keyset row has no name";
+    id shared = layoutProps[keysProp];
+    double keyWidth = [shared respondsToSelector:@selector(doubleValue)] ? [shared doubleValue] : DynamicWidth(stockKeys[0], rowProps);
+    if (!shared)
+        for (id key in stockKeys)
+            if (fabs(DynamicWidth(key, rowProps) - keyWidth) > 0.001) return @"uneven keys";
+    double space = keyWidth * stockKeys.count + DynamicWidth(children[at - 1], rowProps) + DynamicWidth(children[at + 1], rowProps);
+    NSUInteger count = labels.count;
+    double width = MIN(keyWidth, space / count), padding = MAX((space - width * count) / 2, 0);
+    if (width < 0.2) return @"keys don't fit";
+
+    // Small-Letters planes label lowercase keys in capitals (the small-display plane is
+    // the lowercase-looking one); new keys follow whatever the row does.
+    BOOL capitalDisplay = NO;
+    for (id key in stockKeys) {
+        NSString *shown = TPRProperties(key)[@"KBdisplayString"], *typed = TPRProperties(key)[@"KBrepresentedString"];
+        if ([shown isKindOfClass:[NSString class]] && [typed isKindOfClass:[NSString class]] &&
+            ![shown isEqualToString:typed] && [shown isEqualToString:typed.uppercaseString])
+            capitalDisplay = YES;
+    }
+
+    // Per-key attributes ("more-after" on the apostrophe) sit in a list at the keyset row's
+    // position in the row's attribute list; UIKit pairs them with the keys by index.
+    id attrList = at < TPRSubtrees(attrRow).count ? TPRSubtrees(attrRow)[at] : nil;
+    NSArray *stockAttrs = TPRType(attrList) == TPRNodeList ? TPRSubtrees(attrList) : nil;
+    BOOL hasAttrs = stockAttrs.count == stockKeys.count;
+
+    NSUInteger rowTag = [labels componentsJoinedByString:@"\x1f"].hash;
+    NSMutableArray *newKeys = [NSMutableArray array], *newAttrs = [NSMutableArray array];
+    NSHashTable *used = [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality];
+    for (NSUInteger i = 0; i < count; i++) {
+        NSUInteger stock = [defaults indexOfObject:labels[i]];
+        id<TPRKBTree> key;
+        if (stock != NSNotFound && ![used containsObject:stockKeys[stock]]) {
+            key = stockKeys[stock];   // Apple's own key, moved
+            [used addObject:key];
+        } else {
+            // A key from the same part of Apple's row (its display corner).
+            id source = stock != NSNotFound ? stockKeys[stock] : stockKeys[MIN(i * stockKeys.count / count, stockKeys.count - 1)];
+            key = [source copy];
+            if (!key || key == source) return @"key copy failed";
+            NSMutableDictionary *props = [TPRProperties(source) mutableCopy];
+            if (stock == NSNotFound) {
+                props[@"KBdisplayString"] = capitalDisplay ? labels[i].uppercaseString : labels[i];
+                props[@"KBrepresentedString"] = labels[i];
+                // A plain key, whatever the donor was (it may be a localized currency key).
+                props[@"KBdisplayType"] = @0;
+                [props removeObjectForKey:@"variant-type"];
+                [props removeObjectForKey:@"KBlocalizationKey"];
+            }
+            [props removeObjectForKey:@"KBshape"];
+            [key setProperties:props];
+            // Key views are cached by key name: it encodes the row's contents (and the
+            // lettering, which differs between the two lowercase planes).
+            [key setName:[NSString stringWithFormat:@"TPRKey-%lx-%ld-%lu-%lu%@", (unsigned long)rowTag, (long)kind,
+                          (unsigned long)row, (unsigned long)i, capitalDisplay ? @"C" : @""]];
+            [key setCache:[NSMutableDictionary dictionary]];
+            [key setSubtrees:nil];   // no long-press list (an empty one crashes on touch)
+        }
+        [newKeys addObject:key];
+        if (hasAttrs) {
+            NSMutableDictionary *attrs = PositionAttributes(stockAttrs, i, count);
+            id own = stock != NSNotFound ? stockAttrs[stock] : nil;
+            if ([own isKindOfClass:[NSDictionary class]] && own[@"more-after"]) attrs[@"more-after"] = own[@"more-after"];
+            [newAttrs addObject:attrs];
+        }
+    }
+    for (id key in stockKeys)
+        if (![used containsObject:key]) [removed addObject:key];
+
+    NSString *(^units)(double) = ^(double value) { return [NSString stringWithFormat:@"%.6f", value]; };
+    layoutProps[keysProp] = units(width);
+    for (id pad in @[ children[at - 1], children[at + 1] ])
+        rowProps[DynamicWidthProperty(pad, rowProps) ?: TPRProperties(pad)[@"KBrepresentedString"]] = units(padding);
+    [(id<TPRKBTree>)layout setProperties:layoutProps];
+    [(id<TPRKBTree>)rowLayout setProperties:rowProps];
+    [(id<TPRKBTree>)keysetRow setSubtrees:newKeys];
+    if (hasAttrs) [(id<TPRKBTree>)attrList setSubtrees:newAttrs];
+    return nil;
+}
+
+static NSUInteger CustomizeDynamicPlane(id plane, BOOL lettersStock, TPRConfig *config, NSString **why) {
+    TPRKeyPlane kind = KeyPlaneOf(plane);
+    BOOL letters = kind == TPRKeyPlaneLetters || kind == TPRKeyPlaneShifted;
+    if (letters ? !lettersStock : !IsStockDynamicPlane(plane, kind)) return 0;
+    id layout, rowSet;
+    if (!FindDynamicRowSet(plane, &layout, &rowSet)) return 0;
+    // UIKit reads widths from the plane's first key layout.
+    if (layout != TPRChildOfType(plane, TPRNodeKeylayout)) { *why = @"not the plane's first key layout"; return 0; }
+    NSArray<NSNumber *> *rows = DynamicCharacterRows(rowSet);
+    NSArray *attrRows = TPRSubtrees(TPRChildOfType(layout, TPRNodeAttributeSet));
+    NSHashTable *removed = [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality];
+    NSUInteger changed = 0;
+    for (NSUInteger row = 0; row < TPRKeyRowCount && row < rows.count; row++) {
+        NSArray *labels = [config keysForPlane:kind row:row];
+        if (!labels) continue;
+        NSUInteger index = rows[row].unsignedIntegerValue;
+        id attrRow = attrRows.count == TPRSubtrees(rowSet).count ? attrRows[index] : nil;
+        NSString *problem = CustomizeDynamicRow(layout, TPRSubtrees(rowSet)[index], attrRow, row, kind, labels, removed);
+        if (problem) *why = [NSString stringWithFormat:@"row %lu: %@", (unsigned long)row + 1, problem];
+        else changed++;
+    }
+    PruneKeyCache(plane, removed);
+    return changed;
+}
+
 // Applies the Keys page to a copied plane. Returns how many rows changed; *why gets the
 // reason a configured row couldn't be applied, if one couldn't.
 static NSUInteger CustomizePlane(id plane, BOOL lettersStock, TPRConfig *config, NSString **why) {
@@ -555,6 +991,94 @@ static NSString *ScalePlaneY(id plane, double scale) {
 // Our own entries in UIKit's property dictionaries (UIKit ignores unknown keys).
 static NSString *const kLandscapeKey = @"TPRlandscape";   // on a patched keyboard
 static NSString *const kPatchedPlaneKey = @"TPRpatched";  // on each of its keyplanes
+static NSString *const kExtraRowsKey = @"TPRextraRows";   // on a patched dynamic keyboard: rows added
+static NSString *const kHeightFactorKey = @"TPRheightFactor";   // and how much taller it gets
+static NSString *const kLandscapeHeightFactorKey = @"TPRlandscapeHeightFactor";   // the same, in landscape
+
+// Height factors per layout of dynamic keyboard, @[portrait, landscape]: "QWERTY" for
+// "Dynamic-QWERTY-Small", "QWERTZ-German" for "Dynamic-QWERTZ-German-Small". TextInputUI sizes
+// a keyboard by its input mode's layout (that same string) and keeps a layout's keyboard
+// across keyboard types and rotations, so the factor goes with the layout, not with whichever
+// keyboard was handed back last.
+static NSMutableDictionary<NSString *, NSArray<NSNumber *> *> *DynamicHeightFactors(void) {
+    static NSMutableDictionary *factors;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ factors = [NSMutableDictionary dictionary]; });
+    return factors;
+}
+
+static BOOL IsPadName(NSString *name) {
+    for (NSString *pad in @[ @"NumberPad", @"PhonePad", @"DecimalPad", @"PasscodePad" ])
+        if ([name containsString:pad] && ![name containsString:@"NamePhonePad"]) return YES;
+    return NO;
+}
+
+// "Dynamic-QWERTZ-German-Small-Email" -> layout "QWERTZ-German", kind "Email"; the kind is ""
+// for a layout's own keyboard. NO for names that aren't dynamic keyboards.
+static BOOL ParseDynamicName(NSString *name, NSString **layout, NSString **kind) {
+    NSArray<NSString *> *parts = [name componentsSeparatedByString:@"-"];
+    if (parts.count < 3 || ![parts[0] isEqualToString:@"Dynamic"]) return NO;
+    NSUInteger size = NSNotFound;   // the screen-size part TextInputUI appends
+    for (NSUInteger i = 2; i < parts.count; i++)
+        if ([@[ @"Mini", @"Small", @"Medium", @"Large", @"Grand" ] containsObject:parts[i]]) size = i;
+    if (size == NSNotFound) return NO;
+    if (layout) *layout = [[parts subarrayWithRange:NSMakeRange(1, size - 1)] componentsJoinedByString:@"-"];
+    if (kind) *kind = [[parts subarrayWithRange:NSMakeRange(size + 1, parts.count - size - 1)] componentsJoinedByString:@"-"];
+    return YES;
+}
+
+// The Keyboard Types switch for a keyboard named "...-Email" (URL, ...); YES for other names.
+static BOOL RowOnKeyboardNamed(NSString *name, TPRConfig *config) {
+    if ([name containsString:@"-Email"]) return config.rowOnEmail;
+    if ([name containsString:@"-URL"] || [name containsString:@"AlphaWithURL"]) return config.rowOnWeb;
+    if ([name containsString:@"-Twitter"]) return config.rowOnTwitter;
+    return YES;
+}
+
+NSString *TPRDynamicSharedName(NSString *name, TPRConfig *config) {
+    NSString *layout, *kind;
+    if (gDynamicUnsupported || !ParseDynamicName(name, &layout, &kind) || !kind.length || IsPadName(name)) return nil;
+    if (!config.enabled || RowOnKeyboardNamed(name, config)) return nil;
+    NSString *app = NSBundle.mainBundle.bundleIdentifier;
+    if (app && [config.excludedApps containsObject:app]) return nil;
+    return [name substringToIndex:name.length - kind.length - 1];
+}
+
+double TPRDynamicHeightFactor(NSString *layout, NSInteger keyboardType, BOOL landscape, TPRConfig *config) {
+    switch (keyboardType) {
+        case 4: case 5: case 8: case 11: return 1;   // number, phone, decimal, ASCII number pads
+        case 6: return 1;                             // name-phone pad: left as Apple's (see BuildPatchedKeyboard)
+        case 7: if (!config.rowOnEmail) return 1; break;
+        case 3: case 10: if (!config.rowOnWeb) return 1; break;   // URL, web search
+        case 9: if (!config.rowOnTwitter) return 1; break;
+        default: break;
+    }
+    if (![layout isKindOfClass:[NSString class]]) return 1;
+    NSString *parsed;
+    if (ParseDynamicName(layout, &parsed, NULL)) layout = parsed;   // in case a keyboard name comes instead
+    @synchronized(DynamicHeightFactors()) {
+        NSArray<NSNumber *> *factors = DynamicHeightFactors()[layout];
+        return factors ? factors[landscape ? 1 : 0].doubleValue : 1;
+    }
+}
+
+// Called with every keyboard handed back (patched or not). Only a layout's own keyboard
+// counts: pads and types switched off are sized as Apple's by TPRDynamicHeightFactor.
+static void RecordDynamicKeyboard(id keyboard, NSString *name, id patched, BOOL landscape) {
+    NSString *layout, *kind;
+    if (!ParseDynamicName(name, &layout, &kind) || kind.length || IsPadName(name) ||
+        [name containsString:@"NamePhonePad"] || !TPRIsDynamicKeyboard(keyboard))
+        return;
+    NSDictionary *props = TPRProperties(patched);
+    NSNumber *factor = [props[kHeightFactorKey] isKindOfClass:[NSNumber class]] ? props[kHeightFactorKey] : @1;
+    NSNumber *landscapeFactor = [props[kLandscapeHeightFactorKey] isKindOfClass:[NSNumber class]]
+        ? props[kLandscapeHeightFactorKey] : factor;
+    @synchronized(DynamicHeightFactors()) {
+        NSArray<NSNumber *> *old = DynamicHeightFactors()[layout];
+        // A landscape-only keyboard (built when landscape differs) leaves the portrait factor be.
+        DynamicHeightFactors()[layout] = landscape ? @[ old ? old[0] : @1, factor ] : @[ factor, landscapeFactor ];
+    }
+}
 
 // Every keyplane of a patched keyboard is tagged as ours, and keysets/geometry sets that
 // PatchPlane didn't rename (planes without a row) get the fingerprint too. Custom 123/ABC
@@ -601,7 +1125,7 @@ BOOL TPRIsLandscapeKeyboard(id keyboard, NSString *name) {
     return TPRGetFrames(keyboard, &frame, NULL) && frame.size.height > 0 && frame.size.width / frame.size.height > 2.4;
 }
 
-static id BuildPatchedKeyboard(id keyboard, NSString *name, TPRConfig *config, NSString **outcome) {
+static id BuildPatchedKeyboard(id keyboard, NSString *name, TPRConfig *config, BOOL dynamicLandscape, NSString **outcome) {
     if (!config.enabled) { *outcome = @"SKIP disabled"; return nil; }
     NSString *app = NSBundle.mainBundle.bundleIdentifier;
     if (app && [config.excludedApps containsObject:app]) { *outcome = @"SKIP excluded app"; return nil; }
@@ -619,13 +1143,17 @@ static id BuildPatchedKeyboard(id keyboard, NSString *name, TPRConfig *config, N
             [(id<TPRKBTree>)plane isAlphabeticPlane])
             hasLetters = YES;
     if (!hasLetters) { *outcome = @"SKIP no letters plane"; return nil; }
-    if (([name containsString:@"-Email"] && !config.rowOnEmail) ||
-        (([name containsString:@"-URL"] || [name containsString:@"AlphaWithURL"]) && !config.rowOnWeb) ||
-        ([name containsString:@"-Twitter"] && !config.rowOnTwitter)) {
+    if (!RowOnKeyboardNamed(name, config)) {
         *outcome = @"SKIP keyboard type turned off";
         return nil;
     }
-    BOOL landscape = TPRIsLandscapeKeyboard(keyboard, name);
+    BOOL dynamic = TPRIsDynamicKeyboard(keyboard);
+    if (dynamic && gDynamicUnsupported) { *outcome = [@"SKIP " stringByAppendingString:gDynamicUnsupported]; return nil; }
+    // iOS 26 sizes a keyboard once for all its planes, so the name-phone pad's phone plane
+    // would be stretched along with its letters: that keyboard stays Apple's.
+    if (dynamic && [name containsString:@"NamePhonePad"]) { *outcome = @"SKIP name-phone pad"; return nil; }
+    // One dynamic tree serves both orientations: the caller says which one this copy is for.
+    BOOL landscape = dynamic ? dynamicLandscape : TPRIsLandscapeKeyboard(keyboard, name);
     // "Show in Landscape" is about the extra row and the height it adds: turned off, a
     // landscape keyboard keeps its size but still gets custom keys (and their labels).
     BOOL rowOff = landscape && !config.showInLandscape;
@@ -637,12 +1165,13 @@ static id BuildPatchedKeyboard(id keyboard, NSString *name, TPRConfig *config, N
     BOOL lettersStock = config.hasCustomKeys;
     for (id plane in TPRSubtrees(keyboard))
         if (lettersStock && TPRType(plane) == TPRNodeKeyplane && PlaneKind(plane) != TPRPlaneNumbers)
-            lettersStock = IsStockKeyPlane(plane, KeyPlaneOf(plane));
+            lettersStock = dynamic ? IsStockDynamicPlane(plane, KeyPlaneOf(plane)) : IsStockKeyPlane(plane, KeyPlaneOf(plane));
 
-    NSMutableArray *planes = [NSMutableArray array];
+    NSUInteger extraRows = 0;
+    NSMutableArray *planes = [NSMutableArray array], *rowless = [NSMutableArray array];
     CGFloat pitch = 0;
     NSUInteger patchedCount = 0, customRows = 0;
-    NSString *keysProblem = nil;
+    NSString *keysProblem = nil, *rowProblem = nil;
     for (id plane in TPRSubtrees(keyboard)) {
         // `keyboard` is our pristine copy: everything handed to UIKit must be a fresh
         // copy (UIKit lays trees out in place), even planes that get no extra row.
@@ -653,8 +1182,26 @@ static id BuildPatchedKeyboard(id keyboard, NSString *name, TPRConfig *config, N
         if (!copy) { *outcome = [NSString stringWithFormat:@"SKIP copy failed: %@", TPRName(plane)]; return nil; }
         BOOL keyplane = TPRType(plane) == TPRNodeKeyplane;
         NSArray *labels = keyplane && !rowOff ? [config rowForPlane:PlaneKind(plane) landscape:landscape] : nil;
-        BOOL changed = NO;
-        if (labels.count) {
+        BOOL changed = NO, gotRow = NO;
+        if (labels.count && dynamic) {
+            NSArray *hints = config.symbolHints && PlaneKind(plane) == TPRPlaneLowercase
+                ? [config rowForPlane:TPRPlaneShifted landscape:landscape] : nil;
+            NSString *why = PatchDynamicPlane(copy, labels, hints, InsertRowForPlane(PlaneKind(plane)), config.fingerprint);
+            if (why && PlaneKind(plane) != TPRPlaneNumbers) {
+                *outcome = [NSString stringWithFormat:@"SKIP %@: %@", TPRName(plane), why];
+                return nil;
+            }
+            if (why) {   // start that plane over from a fresh copy
+                rowProblem = [NSString stringWithFormat:@"%@: %@", TPRName(plane), why];
+                NSUInteger freshBudget = kCopyBudget;
+                copy = DeepCopy(plane, [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsObjectPointerPersonality
+                                                             valueOptions:NSPointerFunctionsStrongMemory], &freshBudget, 0);
+                if (!copy) { *outcome = [NSString stringWithFormat:@"SKIP copy failed: %@", TPRName(plane)]; return nil; }
+            } else {
+                changed = gotRow = YES;
+                extraRows = 1;
+            }
+        } else if (labels.count) {
             CGFloat planePitch = 0;
             NSArray *hints = config.symbolHints && PlaneKind(plane) == TPRPlaneLowercase
                 ? [config rowForPlane:TPRPlaneShifted landscape:landscape] : nil;
@@ -678,7 +1225,8 @@ static id BuildPatchedKeyboard(id keyboard, NSString *name, TPRConfig *config, N
         }
         // Custom keys after the extra row (which they leave in place), before Key Height.
         if (keyplane && config.hasCustomKeys) {
-            NSUInteger rows = CustomizePlane(copy, lettersStock, config, &keysProblem);
+            NSUInteger rows = dynamic ? CustomizeDynamicPlane(copy, lettersStock, config, &keysProblem)
+                                      : CustomizePlane(copy, lettersStock, config, &keysProblem);
             customRows += rows;
             if (rows) changed = YES;
         }
@@ -689,9 +1237,15 @@ static id BuildPatchedKeyboard(id keyboard, NSString *name, TPRConfig *config, N
             changed = YES;
         }
         if (changed) patchedCount++;
+        if (keyplane && dynamic && !gotRow) [rowless addObject:copy];
         [planes addObject:copy];
     }
     if (!patchedCount) { *outcome = @"SKIP no rows configured"; return nil; }
+    if (dynamic && extraRows)
+        for (id plane in rowless) {
+            NSString *why = InsertDynamicSpacer(plane, config.fingerprint);
+            if (why) { *outcome = [NSString stringWithFormat:@"SKIP %@: spacer: %@", TPRName(plane), why]; return nil; }
+        }
     for (id plane in planes)
         if (TPRType(plane) == TPRNodeKeyplane) MarkPlane(plane, config.fingerprint);
 
@@ -706,13 +1260,31 @@ static id BuildPatchedKeyboard(id keyboard, NSString *name, TPRConfig *config, N
         props[@"KBshape"] = shape;
     }
     props[kLandscapeKey] = @(landscape);
+    if (dynamic) {
+        // TextInputUI splits the keyboard's height between its rows: grow it by the added row
+        // (Apple's dynamic letter planes have 4 rows) and apply Key Height on top.
+        NSUInteger baseRows = 0;
+        id layout, rowSet;
+        for (id plane in TPRSubtrees(keyboard))
+            if (!baseRows && TPRType(plane) == TPRNodeKeyplane && FindDynamicRowSet(plane, &layout, &rowSet))
+                baseRows = TPRSubtrees(rowSet).count;
+        double factor = (baseRows ? (double)(baseRows + extraRows) / baseRows : 1) * heightScale;
+        props[kExtraRowsKey] = @(extraRows);
+        props[kHeightFactorKey] = @(factor);
+        // A tree built for portrait also serves landscape unless landscape differs, and then
+        // its own landscape copy only keeps the height with the row shown.
+        props[kLandscapeHeightFactorKey] = @(landscape || config.showInLandscape ? factor : 1);
+    }
     if (TPRName(keyboard)) [patched setName:TPRName(keyboard)];
     [patched setProperties:props];
     [patched setSubtrees:planes];
     [patched setCache:[NSMutableDictionary dictionary]];
-    *outcome = [NSString stringWithFormat:@"PATCHED %lu/%lu planes, +%.0f design pt%@, %lu custom key rows%@",
-                (unsigned long)patchedCount, (unsigned long)planes.count, pitch, landscape ? @" (landscape)" : @"",
-                (unsigned long)customRows, keysProblem ? [@"; keys " stringByAppendingString:keysProblem] : @""];
+    *outcome = [NSString stringWithFormat:@"PATCHED %lu/%lu planes, %@%@, %lu custom key rows%@%@",
+                (unsigned long)patchedCount, (unsigned long)planes.count,
+                dynamic ? [NSString stringWithFormat:@"dynamic +%lu row", (unsigned long)extraRows]
+                        : [NSString stringWithFormat:@"+%.0f design pt", pitch], landscape ? @" (landscape)" : @"",
+                (unsigned long)customRows, keysProblem ? [@"; keys " stringByAppendingString:keysProblem] : @"",
+                rowProblem ? [@"; no row on " stringByAppendingString:rowProblem] : @""];
     return patched;
 }
 
@@ -741,26 +1313,40 @@ static id PristineCopy(id keyboard) {
     return pristine;
 }
 
-id TPRPatchKeyboard(id keyboard, NSString *name, TPRConfig *config, NSString **outcome) {
+id TPRPatchKeyboard(id keyboard, NSString *name, TPRConfig *config, BOOL landscape, NSString **outcome) {
     // The serializer hands back one cached keyboard object per name; mirror that
     // by handing back one patched copy per original, so UIKit sees a stable object.
+    // iOS 26 serves several names (keyboard types) and both orientations from one
+    // original, so each name and orientation gets its own copy.
+    landscape = landscape && TPRIsDynamicKeyboard(keyboard);
+    NSString *variant = [NSString stringWithFormat:@"%@%@", name, landscape ? @"|landscape" : @""];
     @synchronized(PatchedCache()) {
-        NSArray *entry = [PatchedCache() objectForKey:keyboard];
+        NSMutableDictionary *entries = [PatchedCache() objectForKey:keyboard];
+        NSArray *entry = entries[variant];
         if ([entry.firstObject isEqual:config.fingerprint]) {
             *outcome = @"cached";
-            return entry.lastObject == [NSNull null] ? nil : entry.lastObject;
+            id cached = entry.lastObject == [NSNull null] ? nil : entry.lastObject;
+            RecordDynamicKeyboard(keyboard, name, cached, landscape);
+            return cached;
         }
         id patched = nil;
+        gCopyingDynamic = TPRIsDynamicKeyboard(keyboard);
         @try {
             // Copied at first sight even when not patching: UIKit lays the original out in place.
             id pristine = TPRIsTree(keyboard) ? PristineCopy(keyboard) : nil;
-            patched = pristine ? BuildPatchedKeyboard(pristine, name, config, outcome) : nil;
+            patched = pristine ? BuildPatchedKeyboard(pristine, name, config, landscape, outcome) : nil;
             if (!pristine) *outcome = @"SKIP pristine copy failed";
         } @catch (NSException *e) {
             *outcome = [NSString stringWithFormat:@"SKIP exception %@", e.reason];
             patched = nil;
         }
-        [PatchedCache() setObject:@[ config.fingerprint, patched ?: [NSNull null] ] forKey:keyboard];
+        // Copies made for an older config are dropped with it.
+        NSMutableDictionary *current = [NSMutableDictionary dictionary];
+        for (NSString *key in entries)
+            if ([[entries[key] firstObject] isEqual:config.fingerprint]) current[key] = entries[key];
+        current[variant] = @[ config.fingerprint, patched ?: [NSNull null] ];
+        [PatchedCache() setObject:current forKey:keyboard];
+        RecordDynamicKeyboard(keyboard, name, patched, landscape);
         return patched;
     }
 }
@@ -811,9 +1397,11 @@ BOOL TPRRelabelShiftedRow(id keyplane, BOOL autoShifted, BOOL landscape, TPRConf
         [(id<TPRKBTree>)keys[i] setCache:[NSMutableDictionary dictionary]];
     }
     // Rendered keyplane images are keyed partly by the keyset's name: give each
-    // variant its own so the two versions are cached separately.
+    // variant its own so the two versions are cached separately. (Dynamic keyboards cache key
+    // views by the keys' names, changed above; their row's keyset must keep its name, which
+    // its key width is looked up by.)
     id keyset = FindKeysetContaining(keyplane, row, 0);
-    NSString *name = TPRName(keyset);
+    NSString *name = TPRType(keyset) == TPRNodeKeyset ? TPRName(keyset) : nil;
     NSRange mark = [name rangeOfString:@"-TPRv"];
     if (name && mark.location != NSNotFound) name = [name substringToIndex:mark.location];
     if (name) [(id<TPRKBTree>)keyset setName:[NSString stringWithFormat:@"%@-TPRv%@", name, autoShifted ? @"a" : @"m"]];

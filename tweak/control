@@ -1,6 +1,6 @@
 Package: dev.rtrdd.toprow
 Name: TopRow
-Version: 2.0.0
+Version: 2.1.0
 Architecture: iphoneos-arm64
 Description: A number row on top, and every key your way
  Adds a number row to the top of the stock iOS keyboard: 1-0 on letters,

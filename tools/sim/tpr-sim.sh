@@ -11,7 +11,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-UDID="$(cat "$HERE/.udid")"
+UDID="${TPR_UDID:-$(cat "$HERE/.udid")}"   # TPR_UDID picks another simulator
 BUNDLE=dev.rtrdd.tprhost
 BUILD="$HERE/build"
 OUT="$HERE/out"

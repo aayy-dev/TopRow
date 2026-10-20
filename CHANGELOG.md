@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.0
+
+- iOS 26 support. iOS 26 builds the iPhone keyboard a new way, which TopRow 2.0 left untouched. Now the row, the Keys page, Symbol Hints, Key Height, Bottom Area, the 123/ABC/#+= labels, the Keyboard Types switches, Show in Landscape and landscape rows all work there. Tested on an iPhone 11 with iOS 26.0.
+- On iOS 26 the row also comes to other letter layouts, such as German (QWERTZ), French (AZERTY), Spanish, Russian, Greek and Arabic, spread across the full width of their first row.
+- What's different on iOS 26: all pages of a keyboard share one height, so a page whose row you leave empty gets an empty band at the top instead of a shorter keyboard (its keys keep Apple's size). The email and web-address keyboards share the main keyboard's 123 and #+= pages, so those take your Keys page rows too. The name-and-phone-number keyboard stays stock.
+- iOS 16.1–18 build a few minority layouts (Hausa, Yoruba, Sami and others) the new way; on those versions they stay stock, as in 2.0.
+- TopRow no longer starts up in command-line tools, helper tools inside apps (such as TrollStore's) or system daemons, and its log lines no longer show up in terminal output. (The tweak loader still maps it into anything that uses UIKit; it now returns at once there.)
+
 ## 2.0.0
 
 - New **Keys** page: change any key on the letters, Shift / Caps Lock, 123 and #+= pages. Add, remove, reorder or retype keys, up to 12 per row. Shift rows follow your letters in capitals unless you set them. Keys kept from Apple's row keep their long-press accents and your region's currency signs. Applies to the US English (QWERTY) layout in every size and keyboard type, and in landscape even with Show in Landscape off; other languages and the email and web-address number pages keep their own keys. The page has its own Preview field.

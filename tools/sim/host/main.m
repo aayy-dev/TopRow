@@ -13,9 +13,11 @@
 //   dump <label>              dump keyboard tree + current keyplane name
 //   tapkey <key-name>         simulate a touch at the centre of the named key
 //   tapchar <string>          simulateTouchForCharacter:
+//   hold <x> <y> <secs>       long press at a layout point (real touch)
 //   text                      log the text field contents
 //   clear                     clear the text field
 //   info                      log keyboard name, keyplane name, layout frame
+//   trace on | trace mark <t> log keyboard loading / sizing calls to <tmp>/tpr-trace.txt
 
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
@@ -194,8 +196,9 @@ static void SwipeLayoutPoint(UIView *layout, CGPoint p, CGFloat dy) {
     SendTouch(touch, UITouchPhaseEnded, CGPointMake(w.x, w.y + dy));
 }
 
-// Tap at a point given in keyboard-layout coordinates.
-static void TapLayoutPoint(UIView *layout, CGPoint p) {
+// Tap at a point given in keyboard-layout coordinates, holding it for `hold` seconds
+// (long-press popups) when that's > 0.
+static void TapLayoutPointHolding(UIView *layout, CGPoint p, NSTimeInterval hold) {
     UIWindow *window = layout.window;
     CGPoint w = [layout convertPoint:p toView:window];
     UITouch *touch = [UITouch new];
@@ -212,7 +215,138 @@ static void TapLayoutPoint(UIView *layout, CGPoint p) {
         else Out(@"UITouch lacks %@", name);
     }
     SendTouch(touch, UITouchPhaseBegan, w);
+    if (hold > 0) {
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:hold]];
+        SendTouch(touch, UITouchPhaseStationary, w);
+    }
     SendTouch(touch, UITouchPhaseEnded, w);
+}
+
+static void TapLayoutPoint(UIView *layout, CGPoint p) {
+    TapLayoutPointHolding(layout, p, 0);
+}
+
+// ---- call trace (keyboard loading and sizing; iOS 26) ----------------------------
+// "trace on" wraps the methods below (and whatever the tweak installed in them) and appends
+// one numbered line per call to <tmp>/tpr-trace.txt; "trace mark <text>" adds a marker line.
+
+static NSUInteger gTraceSeq;
+
+static void Trace(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void Trace(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *path = TmpPath(@"tpr-trace.txt");
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    [fh seekToEndOfFile];
+    [fh writeData:[[NSString stringWithFormat:@"%04lu %@\n", (unsigned long)++gTraceSeq, line]
+                      dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
+
+static NSString *TraitsDesc(id traits) {
+    if (!traits) return @"nil";
+    long long o = [traits respondsToSelector:NSSelectorFromString(@"orientation")]
+        ? ((long long (*)(id, SEL))objc_msgSend)(traits, NSSelectorFromString(@"orientation")) : -1;
+    double w = [traits respondsToSelector:NSSelectorFromString(@"keyboardWidth")]
+        ? ((double (*)(id, SEL))objc_msgSend)(traits, NSSelectorFromString(@"keyboardWidth")) : -1;
+    return [NSString stringWithFormat:@"traits(o=%lld w=%.0f)", o, w];
+}
+
+// Caller frames 2-4, symbol names only.
+static NSString *Callers(void) {
+    NSArray *syms = [NSThread callStackSymbols];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSUInteger i = 2; i < MIN(syms.count, (NSUInteger)6); i++) {
+        NSString *s = syms[i];
+        NSRange r = [s rangeOfString:@" 0x"];
+        if (r.location != NSNotFound) {
+            NSRange sym = [s rangeOfString:@" " options:0 range:NSMakeRange(r.location + 3, s.length - r.location - 3)];
+            if (sym.location != NSNotFound) s = [s substringFromIndex:sym.location + 1];
+        }
+        [out addObject:s];
+    }
+    return [out componentsJoinedByString:@" < "];
+}
+
+static void InstallTrace(void) {
+    static BOOL done;
+    if (done) return;
+    done = YES;
+    Class star = NSClassFromString(@"UIKeyboardLayoutStar"), starMeta = object_getClass(star);
+    Class tkp = object_getClass(NSClassFromString(@"TUIKeyplane"));
+    Class tkpv = object_getClass(NSClassFromString(@"TUIKeyplaneView"));
+    Class factory = NSClassFromString(@"TUIKeyboardLayoutFactory");
+    Class ser = NSClassFromString(@"TUIKBGraphSerialization");
+    __block IMP o1, o2, o3, o4, o5, o6, o7, o8, o9, o10;
+    SEL s1 = NSSelectorFromString(@"keyboardWithName:screenTraits:");
+    Method m1 = class_getInstanceMethod(starMeta, s1);
+    o1 = method_setImplementation(m1, imp_implementationWithBlock(^id(id me, id name, id traits) {
+        id kb = ((id (*)(id, SEL, id, id))o1)(me, s1, name, traits);
+        Trace(@"+keyboardWithName:%@ %@ -> %p", name, TraitsDesc(traits), kb);
+        return kb;
+    }));
+    SEL s2 = NSSelectorFromString(@"setKeyboardName:appearance:");
+    o2 = method_setImplementation(class_getInstanceMethod(star, s2), imp_implementationWithBlock(^(id me, id name, long long a) {
+        Trace(@"-setKeyboardName:%@ appearance:%lld (was %@)", name, a, Call(me, @"keyboardName"));
+        ((void (*)(id, SEL, id, long long))o2)(me, s2, name, a);
+    }));
+    SEL s3 = NSSelectorFromString(@"setKeyplaneName:");
+    o3 = method_setImplementation(class_getInstanceMethod(star, s3), imp_implementationWithBlock(^(id me, id name) {
+        Trace(@"-setKeyplaneName:%@", name);
+        ((void (*)(id, SEL, id))o3)(me, s3, name);
+    }));
+    SEL s4 = NSSelectorFromString(@"keyplaneFromKBTree:withType:");
+    o4 = method_setImplementation(class_getInstanceMethod(tkp, s4), imp_implementationWithBlock(^id(id me, id tree, long long type) {
+        id kp = ((id (*)(id, SEL, id, long long))o4)(me, s4, tree, type);
+        Trace(@"+keyplaneFromKBTree:%@ (%p) withType:%lld", Call(tree, @"name"), tree, type);
+        return kp;
+    }));
+    SEL s5 = NSSelectorFromString(@"sizeFromScreenTraits:layout:layoutClass:");
+    o5 = method_setImplementation(class_getInstanceMethod(tkp, s5), imp_implementationWithBlock(^CGSize(id me, id traits, id layout, long long cls) {
+        CGSize size = ((CGSize (*)(id, SEL, id, id, long long))o5)(me, s5, traits, layout, cls);
+        Trace(@"+sizeFromScreenTraits:%@ layout:%@ layoutClass:%lld -> %@%@", TraitsDesc(traits), layout, cls,
+              NSStringFromCGSize(size), [@"  < " stringByAppendingString:Callers()]);
+        return size;
+    }));
+    SEL s6 = NSSelectorFromString(@"keyplaneSizeForLayout:screenTraits:keyboardType:");
+    o6 = method_setImplementation(class_getInstanceMethod(tkpv, s6), imp_implementationWithBlock(^CGSize(id me, id layout, id traits, long long type) {
+        CGSize size = ((CGSize (*)(id, SEL, id, id, long long))o6)(me, s6, layout, traits, type);
+        Trace(@"+keyplaneSizeForLayout:%@ %@ keyboardType:%lld -> %@", layout, TraitsDesc(traits), type, NSStringFromCGSize(size));
+        return size;
+    }));
+    SEL s7 = NSSelectorFromString(@"keyboardSizeForInputMode:screenTraits:keyboardType:");
+    o7 = method_setImplementation(class_getInstanceMethod(starMeta, s7), imp_implementationWithBlock(^CGSize(id me, id mode, id traits, long long type) {
+        CGSize size = ((CGSize (*)(id, SEL, id, id, long long))o7)(me, s7, mode, traits, type);
+        Trace(@"+keyboardSizeForInputMode:%@ %@ keyboardType:%lld -> %@", Call(mode, @"identifier"), TraitsDesc(traits), type,
+              NSStringFromCGSize(size));
+        return size;
+    }));
+    SEL s8 = NSSelectorFromString(@"keyboardWithName:inCache:");
+    o8 = method_setImplementation(class_getInstanceMethod(factory, s8), imp_implementationWithBlock(^id(id me, id name, id cache) {
+        id kb = ((id (*)(id, SEL, id, id))o8)(me, s8, name, cache);
+        Trace(@"-factory keyboardWithName:%@ inCache:%@(%lu) -> %p", name, NSStringFromClass([cache class]),
+              [cache respondsToSelector:@selector(count)] ? (unsigned long)[cache count] : 0UL, kb);
+        return kb;
+    }));
+    SEL s9 = NSSelectorFromString(@"keyboardForName:");
+    o9 = method_setImplementation(class_getInstanceMethod(ser, s9), imp_implementationWithBlock(^id(id me, id name) {
+        id kb = ((id (*)(id, SEL, id))o9)(me, s9, name);
+        Trace(@"-keyboardForName:%@ -> %p", name, kb);
+        return kb;
+    }));
+    SEL s10 = NSSelectorFromString(@"keyForKeyboardName:screenTraits:");
+    o10 = method_setImplementation(class_getInstanceMethod(star, s10), imp_implementationWithBlock(^id(id me, id name, id traits) {
+        id key = ((id (*)(id, SEL, id, id))o10)(me, s10, name, traits);
+        Trace(@"-keyForKeyboardName:%@ %@ -> %@", name, TraitsDesc(traits), key);
+        return key;
+    }));
 }
 
 // ---- view controller ----------------------------------------------------------
@@ -293,6 +427,17 @@ static void TapLayoutPoint(UIView *layout, CGPoint p) {
         CGPoint p = CGPointMake([xy[0] doubleValue], [xy[1] doubleValue]);
         TapLayoutPoint(layout, p);
         Out(@"touch %@ sent", NSStringFromCGPoint(p));
+    } else if ([verb isEqualToString:@"hold"]) {
+        // hold <x> <y> <seconds> in layout coordinates: a long press (real UITouch)
+        NSArray *a = [arg componentsSeparatedByString:@" "];
+        CGPoint p = CGPointMake([a[0] doubleValue], [a[1] doubleValue]);
+        TapLayoutPointHolding(layout, p, a.count > 2 ? [a[2] doubleValue] : 1.0);
+        Out(@"hold %@ sent -> field=\"%@\"", NSStringFromCGPoint(p), self.field.text);
+    } else if ([verb isEqualToString:@"trace"]) {
+        // trace on | trace mark <text>: see InstallTrace (lines go to <tmp>/tpr-trace.txt)
+        if ([arg isEqualToString:@"on"]) InstallTrace();
+        else Trace(@"==== %@ ====", arg);
+        Out(@"trace %@", arg);
     } else if ([verb isEqualToString:@"kbtype"]) {
         // kbtype <UIKeyboardType raw value>: switch the field's keyboard type
         [self.field resignFirstResponder];
@@ -631,6 +776,78 @@ static void TapLayoutPoint(UIView *layout, CGPoint p) {
             [stack addObjectsFromArray:v.subviews];
         }
         Out(@"hints %lu [%@]", (unsigned long)found.count, [[found sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" "]);
+    } else if ([verb isEqualToString:@"keyviews"]) {
+        // keyviews [@][name prefix]: iOS 26 TUIKBKeyViews under the layout: key name, frame in the layout (@: in the window),
+        // label text/frame of any hint label (tag 0x5C10) and the key's displayed string
+        NSMutableArray *parts = [NSMutableArray array], *stack = [NSMutableArray array];
+        if (layout) [stack addObject:layout];
+        while (stack.count) {
+            UIView *v = stack.lastObject; [stack removeLastObject];
+            [stack addObjectsFromArray:v.subviews];
+            if (![v isKindOfClass:NSClassFromString(@"TUIKBKeyView")] || v.window == nil) continue;
+            id key = Call(v, @"key");
+            NSString *name = Call(key, @"name") ?: @"?";
+            NSString *prefix = [arg hasPrefix:@"@"] ? [arg substringFromIndex:1] : arg;
+            if (prefix.length && ![name hasPrefix:prefix]) continue;
+            UILabel *hint = nil;
+            for (UIView *sub in v.subviews) if (sub.tag == 0x5C10) hint = (UILabel *)sub;
+            CGRect f = [v convertRect:v.bounds toView:[arg hasPrefix:@"@"] ? nil : layout];
+            [parts addObject:[NSString stringWithFormat:@"%@'%@'%@ %@%@", name, Call(key, @"displayString"),
+                v.hidden || v.alpha < 0.01 ? @"(hidden)" : @"", NSStringFromCGRect(f),
+                hint ? [NSString stringWithFormat:@" hint '%@'%@%@", hint.text, NSStringFromCGRect(hint.frame), hint.hidden ? @"(hidden)" : @""] : @""]];
+        }
+        Out(@"keyviews %lu: %@", (unsigned long)parts.count, [parts componentsJoinedByString:@" | "]);
+    } else if ([verb isEqualToString:@"kvcheck"]) {
+        // kvcheck [name prefix]: iOS 26: for each key of the current keyplane, does -[TUIKeyplaneView viewForKey:]
+        // return a view that is on screen? (A key renamed under TextInputUI gets a fresh, detached view.)
+        NSMutableArray *stack = [NSMutableArray array];
+        if (layout) [stack addObject:layout];
+        UIView *kpv = nil;
+        while (stack.count && !kpv) {
+            UIView *v = stack.lastObject; [stack removeLastObject];
+            if ([v isKindOfClass:NSClassFromString(@"TUIKeyplaneView")]) kpv = v;
+            [stack addObjectsFromArray:v.subviews];
+        }
+        NSMutableArray *bad = [NSMutableArray array];
+        NSUInteger n = 0;
+        for (id key in Call(Call(layout, @"keyplane"), @"keys")) {
+            NSString *name = Call(key, @"name");
+            if (arg.length && ![name hasPrefix:arg]) continue;
+            n++;
+            UIView *view = ((id (*)(id, SEL, id))objc_msgSend)(kpv, NSSelectorFromString(@"viewForKey:"), key);
+            if (!view.window) [bad addObject:[NSString stringWithFormat:@"%@(%@)", name, view ? @"detached" : @"nil"]];
+        }
+        Out(@"kvcheck kpv=%@ keys=%lu off-screen=%lu %@", kpv ? @"yes" : @"no", (unsigned long)n, (unsigned long)bad.count,
+            [bad componentsJoinedByString:@" "]);
+    } else if ([verb isEqualToString:@"keylayers"]) {
+        // keylayers <key name>: that key view's subviews and sublayers (frames in the key view), shape frames
+        NSMutableArray *stack = [NSMutableArray array];
+        if (layout) [stack addObject:layout];
+        UIView *found = nil;
+        while (stack.count && !found) {
+            UIView *v = stack.lastObject; [stack removeLastObject];
+            [stack addObjectsFromArray:v.subviews];
+            if ([v isKindOfClass:NSClassFromString(@"TUIKBKeyView")] && v.window && [Call(Call(v, @"key"), @"name") isEqual:arg]) found = v;
+        }
+        if (!found) { Out(@"keylayers %@: not found", arg); return; }
+        NSMutableString *s = [NSMutableString stringWithFormat:@"keyview bounds %@", NSStringFromCGRect(found.bounds)];
+        CGRect f, p;
+        id shape = Call(Call(found, @"key"), @"shape");
+        if (ShapeFrame(shape, @"frame", &f) && ShapeFrame(shape, @"paddedFrame", &p))
+            [s appendFormat:@" shape f=%@ p=%@", NSStringFromCGRect(f), NSStringFromCGRect(p)];
+        NSMutableArray *layers = [NSMutableArray arrayWithObject:found.layer];
+        while (layers.count) {
+            CALayer *l = layers.firstObject; [layers removeObjectAtIndex:0];
+            [s appendFormat:@" | %@ %@", NSStringFromClass(l.class), NSStringFromCGRect([l convertRect:l.bounds toLayer:found.layer])];
+            if (l.contents) [s appendString:@"(contents)"];
+            [layers addObjectsFromArray:l.sublayers ?: @[]];
+        }
+        Out(@"keylayers %@: %@", arg, s);
+    } else if ([verb isEqualToString:@"viewtree"]) {
+        // viewtree <file label>: recursiveDescription of the keyboard layout view to tmp/tpr-views-<label>.txt
+        NSString *desc = Call(layout, @"recursiveDescription");
+        [desc writeToFile:TmpPath([NSString stringWithFormat:@"tpr-views-%@.txt", arg]) atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        Out(@"viewtree %@ (%lu bytes)", arg, (unsigned long)desc.length);
     } else if ([verb isEqualToString:@"bottom"]) {
         // bottom: the inputView.bottom gap and each dock item's transform scale
         NSArray *wins = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)(UIWindow.class,
@@ -773,6 +990,17 @@ static void TapLayoutPoint(UIView *layout, CGPoint p) {
         NSString *path = TmpPath([NSString stringWithFormat:@"tpr-methods-%@.txt", arg]);
         [s writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         Out(@"methods %@ -> %@", arg, path);
+    } else if ([verb isEqualToString:@"classes"]) {
+        // classes <substring>: loaded class names containing it
+        unsigned int n = 0;
+        Class *all = objc_copyClassList(&n);
+        NSMutableArray *names = [NSMutableArray array];
+        for (unsigned int i = 0; i < n; i++) {
+            NSString *name = @(class_getName(all[i]));
+            if (name && [name rangeOfString:arg options:NSCaseInsensitiveSearch].location != NSNotFound) [names addObject:name];
+        }
+        free(all);
+        Out(@"classes %@: %@", arg, [[names sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" "]);
     } else if ([verb isEqualToString:@"text"]) {
         Out(@"field=\"%@\"", self.field.text);
     } else if ([verb isEqualToString:@"clear"]) {
@@ -791,6 +1019,10 @@ static void TapLayoutPoint(UIView *layout, CGPoint p) {
 // ---- app ----------------------------------------------------------------------
 
 @interface TPRHostAppDelegate : UIResponder <UIApplicationDelegate>
+@end
+
+// A scene of its own: apps built with the iOS 27 SDK don't launch without the UIScene life cycle.
+@interface TPRHostSceneDelegate : UIResponder <UIWindowSceneDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @end
 
@@ -802,14 +1034,20 @@ static void OnCommand(CFNotificationCenterRef c, void *o, CFNotificationName n, 
 
 @implementation TPRHostAppDelegate
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
-    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, OnCommand,
+                                    CFSTR("dev.rtrdd.tprhost.cmd"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    if (getenv("TPR_TRACE")) InstallTrace();   // SIMCTL_CHILD_TPR_TRACE=1: trace from the first keyboard on
+    return YES;
+}
+@end
+
+@implementation TPRHostSceneDelegate
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)options {
+    self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
     gVC = [TPRHostViewController new];
     self.window.rootViewController = gVC;
     [self.window makeKeyAndVisible];
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, OnCommand,
-                                    CFSTR("dev.rtrdd.tprhost.cmd"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     Out(@"TPRHost launched; tmp=%@", NSTemporaryDirectory());
-    return YES;
 }
 @end
 

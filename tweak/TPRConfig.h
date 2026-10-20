@@ -15,6 +15,8 @@ extern NSString *const TPRReloadNotification;
 @interface TPRConfig : NSObject
 @property (nonatomic, readonly) BOOL enabled;
 @property (nonatomic, readonly) BOOL showInLandscape;
+// Landscape keyboards differ from portrait ones (Show in Landscape off, or a landscape row set).
+@property (nonatomic, readonly) BOOL landscapeDiffers;
 // Per keyboard type (Keyboard Types sub-page); all default to YES.
 @property (nonatomic, readonly) BOOL rowOnEmail;
 @property (nonatomic, readonly) BOOL rowOnWeb;

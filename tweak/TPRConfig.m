@@ -94,6 +94,10 @@ static BOOL BoolValue(id value, BOOL fallback) {
             [landscape addObject:row.count ? row : [NSNull null]];
         }
         _landscapeRows = landscape;
+        _landscapeDiffers = !_showInLandscape;
+        for (NSUInteger kind = 0; kind < landscape.count; kind++)
+            if ([landscape[kind] isKindOfClass:[NSArray class]] && ![landscape[kind] isEqualToArray:_rows[kind]])
+                _landscapeDiffers = YES;
         _label123 = ParseLabel(prefs[@"Label123"]);
         _labelABC = ParseLabel(prefs[@"LabelABC"]);
         _labelSymbols = ParseLabel(prefs[@"LabelSymbols"]);

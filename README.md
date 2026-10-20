@@ -36,7 +36,17 @@ A number row for the stock iOS keyboard, and every other key your way. Free, ope
 
 Add **https://dev.rtrdd.fyi** to Sileo or Zebra and install **TopRow**, or download the `.deb` from [Releases](https://github.com/aayy-dev/TopRow/releases).
 
-Requirements: iPhone on a rootless jailbreak, iOS 15 or later. Developed and tested on iOS 17.3.1 with Dopamine (and the iOS 18.4 simulator); reports from other versions are welcome. Depends on PreferenceLoader and AltList. Does nothing on iPad. Uninstall any other number-row tweak first; two of them on the same keyboard will clash.
+Requirements: iPhone on a rootless jailbreak, iOS 15 or later. Tested on iOS 26.0, 17.3.1 and 16.2 with Dopamine (and the iOS 18.4, 26.3, 26.5 and 27.0 simulators); reports from other versions are welcome. Depends on PreferenceLoader and AltList. Does nothing on iPad. Uninstall any other number-row tweak first; two of them on the same keyboard will clash.
+
+### iOS 26
+
+iOS 26 builds the iPhone keyboard a new way, and TopRow 2.1 supports it: the row, the Keys page, Symbol Hints, Key Height, Bottom Area, labels, the keyboard-type switches and the landscape settings all work as on earlier iOS. On iOS 26 the row also comes to other letter layouts (German, French, Spanish, Russian, Greek, Arabic and more). A few things differ:
+
+- All pages of a keyboard share one height. A page whose row you leave empty (say, no extra row on 123) gets an empty band at the top instead of a shorter keyboard, so its keys keep Apple's size.
+- The email and web-address keyboards share the main keyboard's 123 and #+= pages, so those pages take your Keys page rows too.
+- The name-and-phone-number keyboard stays stock.
+- Keyboards without a letters page (Hebrew, Thai, Korean, Chinese) stay stock, as before.
+- iOS 16.1–18 already build a few minority layouts (Hausa, Yoruba, Sami and others) this new way; on those versions they stay stock, as in TopRow 2.0.
 
 ## Build
 
@@ -61,9 +71,13 @@ UIKit builds each keyboard from a tree of `UIKBTree` nodes that it gets from `-[
 
 The rest is small hooks: `UIKeyboardLayoutStar` for the auto-capitalization option and the 123/ABC/#+= labels, `UIKBKeyplaneView` for symbol hints, and `UIKeyboardDockView` for the Bottom Area slider.
 
+**iOS 26.** Its iPhone keyboards are "dynamic" trees (`KBdynamic`): no geometry at all. TextInputUI's `TUIKeyplaneView` lays them out with Auto Layout, from rows listed in each key layout's default row set and key widths given in relative units. There TopRow inserts its row as a new row in that set, with an empty attribute entry to match and widths that fill the units of Apple's first row. It grows the keyboard through `+[TUIKeyplane sizeFromScreenTraits:layout:layoutClass:]` (renamed in iOS 27; both are hooked), and puts symbol hints on each key's `TUIKBKeyView`. The same tree serves both orientations, so when landscape is set to differ, the landscape copy gets its own cache key.
+
+TopRow's filter loads it into anything with UIKit loaded, and tweak filters can't exclude processes. So the constructor checks that it's running in an app's own executable (not a helper tool next to it, or a daemon packaged as an app) or in an allowed extension, and returns at once otherwise.
+
 | File | What it does |
 | --- | --- |
-| `tweak/Tweak.m` | Hooks, live reload, Bottom Area, hints, labels |
+| `tweak/Tweak.m` | Hooks, live reload, Bottom Area, hints, labels, iOS 26 sizing and orientation |
 | `tweak/TPRPatcher.m` | Copies and patches keyboard trees |
 | `tweak/TPRConfig.m` | Reads and validates settings; the single config snapshot |
 | `tweak/TPRKeyRows.h` | Apple's US rows, shared by the tweak and the Keys page |
@@ -73,7 +87,7 @@ The rest is small hooks: `UIKeyboardLayoutStar` for the auto-capitalization opti
 
 ## Simulator test bench
 
-`tools/sim/tpr-sim.sh` builds a small host app plus a simulator build of the tweak, then drives the keyboard from the command line: switch planes, hit-test rows, change keyboard types, rotate and take screenshots. Put your simulator's UDID in `tools/sim/.udid`, then:
+`tools/sim/tpr-sim.sh` builds a small host app plus a simulator build of the tweak, then drives the keyboard from the command line: switch planes, hit-test rows, change keyboard types and input modes, rotate and take screenshots. Put your simulator's UDID in `tools/sim/.udid` (or set `TPR_UDID`), then:
 
 ```sh
 tools/sim/tpr-sim.sh build
