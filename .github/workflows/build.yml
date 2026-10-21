@@ -87,3 +87,13 @@ jobs:
             echo "SHA-256: \`$(shasum -a 256 "$deb" | cut -d' ' -f1)\`"
           } > "$RUNNER_TEMP/notes.md"
           gh release create "$GITHUB_REF_NAME" "$deb" --title "TopRow $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+
+      - name: Publish to APT repo
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.IOS_REPO_TOKEN }}
+        run: |
+          gh api repos/aayy-dev/aayy-dev.github.io/dispatches \
+            -f event_type=publish-deb \
+            -F "client_payload[repo]=${GITHUB_REPOSITORY}" \
+            -F "client_payload[tag]=${GITHUB_REF_NAME}"
